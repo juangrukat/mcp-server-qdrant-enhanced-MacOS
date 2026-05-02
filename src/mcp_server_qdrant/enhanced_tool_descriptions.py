@@ -43,9 +43,12 @@ DEFAULT_TOOL_GET_COLLECTION_INFO_DESCRIPTION = (
 )
 
 DEFAULT_TOOL_DELETE_COLLECTION_DESCRIPTION = (
-    "Permanently delete a collection and all its data. "
-    "Usage: delete_collection(collection_name='my_collection', confirm=True). "
-    "Requires confirm=True to prevent accidental deletion."
+    "Permanently delete a collection and all its data. Two-step report/apply: "
+    "first call with mode='report' to preview and get a plan_id, then call again "
+    "with mode='apply' and plan_id=<id> to execute. "
+    "Usage: delete_collection(collection_name='my_collection', mode='report') → "
+    "delete_collection(collection_name='my_collection', mode='apply', plan_id='plan_xyz'). "
+    "Plans expire after 10 minutes. Cannot be undone once applied."
 )
 
 DEFAULT_TOOL_HYBRID_SEARCH_DESCRIPTION = (
@@ -100,9 +103,12 @@ DEFAULT_TOOL_INGEST_FOLDER_DESCRIPTION = (
     "Recursively ingest all supported files in a folder into a Qdrant collection. "
     "Supported formats: .txt, .md, .pdf, .docx. Hidden files and system directories are skipped by default. "
     "Usage: ingest_folder(folder_path='/path/to/folder', collection_name='my_docs'). "
-    "Optional: recursive (default True), skip_hidden (default True), extra_metadata (JSON string). "
+    "Optional: recursive (default True), skip_hidden (default True), extra_metadata (JSON string), "
+    "embedding_model (per-request override), mode ('dense' | 'hybrid'). "
+    "Two-step gating supported: run_mode='report' returns a dry-run plan with file inventory and "
+    "a plan_id; run_mode='apply' (default) ingests, optionally validating the supplied plan_id. "
     "Each file gets macOS Spotlight metadata extracted and stored as filterable payload. "
-    "Returns summary of files processed and total chunks stored."
+    "Returns the structured envelope with files_processed, chunks_stored, and per-file errors."
 )
 
 DEFAULT_TOOL_SEARCH_DOCUMENTS_DESCRIPTION = (

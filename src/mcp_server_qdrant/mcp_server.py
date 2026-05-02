@@ -15,6 +15,7 @@ from mcp_server_qdrant.common.func_tools import make_partial_function
 from mcp_server_qdrant.common.wrap_filters import wrap_filters
 from mcp_server_qdrant.embedding_manager import EnhancedEmbeddingModelManager
 from mcp_server_qdrant.embeddings.base import EmbeddingProvider
+from mcp_server_qdrant.mcp_runtime.plan_registry import PlanRegistry
 from mcp_server_qdrant.mcp_runtime.profiles import ToolProfile, is_tool_visible
 from mcp_server_qdrant.mcp_runtime.provider_resolver import ProviderResolver
 from mcp_server_qdrant.qdrant import ArbitraryFilter, Entry, QdrantConnector, BatchEntry
@@ -67,6 +68,9 @@ class QdrantMCPServer(FastMCP):
 
             # Active MCP tool profile (minimal | canonical | full)
             self.active_profile = ToolProfile.parse(qdrant_settings.mcp_tool_profile)
+
+            # Plan registry for report/apply gating on mutating tools.
+            self.plan_registry = PlanRegistry()
 
             # Initialize Qdrant connector with secure connection handling
             self.qdrant_connector = self._create_secure_qdrant_connector()
@@ -419,21 +423,55 @@ class QdrantMCPServer(FastMCP):
             async def delete_collection(
                 ctx: Context,
                 collection_name: Annotated[str, Field(description="Name of the collection to delete")],
-                confirm: Annotated[bool, Field(description="Confirmation that you want to delete this collection")] = False
-            ) -> str:
-                """Delete a collection permanently. Requires confirmation."""
-                if not confirm:
-                    return f"Please set confirm=True to delete collection '{collection_name}'. This action cannot be undone."
-
-                try:
-                    success = await self.qdrant_connector.delete_collection(collection_name)
-                    if success:
-                        return f"Successfully deleted collection '{collection_name}'"
-                    else:
-                        return f"Failed to delete collection '{collection_name}'"
-                except Exception as e:
-                    await ctx.debug(f"Error deleting collection: {e}")
-                    return f"Error deleting collection: {str(e)}"
+                mode: Annotated[str, Field(description="'report' (preview, returns plan_id) or 'apply' (executes)")] = "report",
+                plan_id: Annotated[str | None, Field(description="plan_id from a previous report; required for mode='apply'")] = None,
+            ) -> dict:
+                """Delete a collection. Two-step: 'report' previews, 'apply' executes with plan_id."""
+                from mcp_server_qdrant.mcp_runtime.envelope import envelope_context, success_from, failure_from
+                profile = self.active_profile.name.lower()
+                with envelope_context(profile) as acc:
+                    try:
+                        if mode == "report":
+                            info = await self.qdrant_connector.get_detailed_collection_info(collection_name)
+                            exists = info is not None
+                            payload = {
+                                "tool": "delete_collection",
+                                "target_collection": collection_name,
+                                "exists": exists,
+                                "vector_size": (info.vector_size if info else None),
+                                "distance_metric": (info.distance_metric if info else None),
+                                "points_count": (info.points_count if info else 0),
+                                "destructive": True,
+                                "warnings": [
+                                    "This action permanently deletes ALL vectors and payloads in the collection.",
+                                    "Cannot be undone. The plan_id below must be passed to mode='apply' within the TTL.",
+                                ],
+                            }
+                            plan = await self.plan_registry.create("delete_collection", payload)
+                            return success_from(
+                                acc,
+                                data={"mode": "report", "plan_id": plan.plan_id, "plan": payload, "expires_at": plan.expires_at},
+                                profile=profile,
+                            )
+                        elif mode == "apply":
+                            if not plan_id:
+                                return failure_from(acc, code="missing_plan_id", message="mode='apply' requires plan_id from a prior mode='report' call.", profile=profile)
+                            try:
+                                plan = await self.plan_registry.consume(plan_id, expected_tool="delete_collection")
+                            except ValueError as e:
+                                return failure_from(acc, code="invalid_plan", message=str(e), profile=profile)
+                            target = plan.payload.get("target_collection")
+                            if target != collection_name:
+                                return failure_from(acc, code="plan_target_mismatch", message=f"plan_id targets '{target}' but request was for '{collection_name}'.", profile=profile)
+                            ok = await self.qdrant_connector.delete_collection(collection_name)
+                            if not ok:
+                                return failure_from(acc, code="delete_failed", message=f"Failed to delete collection '{collection_name}'", profile=profile, retryable=True)
+                            return success_from(acc, data={"mode": "apply", "deleted": collection_name}, profile=profile)
+                        else:
+                            return failure_from(acc, code="invalid_mode", message=f"Unknown mode '{mode}'. Use 'report' or 'apply'.", profile=profile)
+                    except Exception as e:
+                        await ctx.debug(f"Error in delete_collection: {e}")
+                        return failure_from(acc, code="internal_error", message=str(e), profile=profile, retryable=True)
 
     def setup_embedding_model_tools(self):
         """Setup enhanced embedding model tools."""
@@ -854,8 +892,15 @@ class QdrantMCPServer(FastMCP):
             extra_metadata: Annotated[str | None, Field(description="Optional extra metadata as JSON string applied to all files")] = None,
             mode: Annotated[str, Field(description="'dense' (default) or 'hybrid' (collection must be hybrid)")] = "dense",
             embedding_model: Annotated[str | None, Field(description="Override the embedding model for this request only")] = None,
+            run_mode: Annotated[str, Field(description="'apply' (default, ingests) or 'report' (dry-run plan with plan_id)")] = "apply",
+            plan_id: Annotated[str | None, Field(description="plan_id from a prior 'report' run; required when run_mode='apply' is intentionally gated")] = None,
         ) -> dict:
-            """Recursively ingest all supported files in a folder."""
+            """Recursively ingest all supported files in a folder.
+
+            run_mode='report' returns a dry-run plan with the file inventory and a plan_id.
+            run_mode='apply' executes the ingest. plan_id is optional for direct apply but
+            required when an agent is gating mutations behind a previewed plan.
+            """
             from mcp_server_qdrant.mcp_runtime.envelope import envelope_context, success_from, failure_from
             from mcp_server_qdrant.ingest.extractor import extract_text, build_chunks, SUPPORTED_EXTENSIONS
             from mcp_server_qdrant.ingest.macos_metadata import get_macos_metadata
@@ -885,6 +930,48 @@ class QdrantMCPServer(FastMCP):
                     and p.suffix.lower() in SUPPORTED_EXTENSIONS
                     and (not skip_hidden or not any(part.startswith(".") for part in p.parts))
                 ]
+
+                # run_mode='report' returns a dry-run plan and stops
+                if run_mode == "report":
+                    by_ext: dict[str, int] = {}
+                    sample = []
+                    for p in all_files:
+                        ext = p.suffix.lower()
+                        by_ext[ext] = by_ext.get(ext, 0) + 1
+                    for p in all_files[:10]:
+                        sample.append(str(p))
+                    payload = {
+                        "tool": "ingest_folder",
+                        "folder": str(folder),
+                        "candidate_files": len(all_files),
+                        "supported_files": len(all_files),
+                        "extensions_summary": by_ext,
+                        "sample_paths": sample,
+                        "estimated_action": "ingest each supported file → extract → chunk → embed → upsert",
+                        "warnings": (
+                            ["No supported files found — apply will be a no-op."] if not all_files else []
+                        ),
+                    }
+                    plan = await self.plan_registry.create("ingest_folder", payload)
+                    return success_from(
+                        acc,
+                        data={"mode": "report", "plan_id": plan.plan_id, "plan": payload, "expires_at": plan.expires_at},
+                        profile=profile,
+                    )
+
+                # If a plan_id is supplied to apply, validate it
+                if plan_id:
+                    try:
+                        plan = await self.plan_registry.consume(plan_id, expected_tool="ingest_folder")
+                    except ValueError as e:
+                        return failure_from(acc, code="invalid_plan", message=str(e), profile=profile)
+                    if plan.payload.get("folder") != str(folder):
+                        return failure_from(
+                            acc,
+                            code="plan_target_mismatch",
+                            message=f"plan_id targets '{plan.payload.get('folder')}' but request was for '{folder}'.",
+                            profile=profile,
+                        )
 
                 if not all_files:
                     return success_from(
