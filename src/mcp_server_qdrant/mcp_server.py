@@ -304,37 +304,55 @@ class QdrantMCPServer(FastMCP):
                 embedding_model: Annotated[str, Field(description="Embedding model, e.g. 'Qwen/Qwen3-Embedding-8B' or 'sentence-transformers/all-MiniLM-L6-v2'")],
                 vector_size: Annotated[int, Field(description="Vector size override — 0 means infer from model")] = 0,
                 distance: Annotated[str, Field(description="Distance metric: cosine, dot, euclidean, manhattan")] = "cosine",
-            ) -> str:
+            ) -> dict:
                 """Create a new collection with specified parameters."""
-                try:
-                    # Validate and get model info
-                    model_info = self.embedding_manager.get_model_info(embedding_model)
-                    if not model_info:
-                        return f"Unknown embedding model: '{embedding_model}'. Use list_embedding_models to see options."
-
-                    # Infer vector size from model unless explicitly overridden
-                    resolved_size = vector_size or model_info.vector_size
-                    if vector_size and vector_size != model_info.vector_size:
-                        if vector_size > model_info.vector_size:
-                            return (
-                                f"Requested vector_size {vector_size} exceeds model max "
-                                f"{model_info.vector_size} for '{embedding_model}'."
+                from mcp_server_qdrant.mcp_runtime.envelope import envelope_context, success_from, failure_from
+                profile = self.active_profile.name.lower()
+                with envelope_context(profile) as acc:
+                    try:
+                        model_info = self.embedding_manager.get_model_info(embedding_model)
+                        if not model_info:
+                            return failure_from(
+                                acc,
+                                code="unknown_embedding_model",
+                                message=f"Unknown embedding model: '{embedding_model}'. Use list_embedding_models to see options.",
+                                profile=profile,
                             )
-                        await ctx.debug(f"Using custom vector_size {vector_size} (model supports up to {model_info.vector_size})")
-                    vector_size = resolved_size
 
-                    success = await self.qdrant_connector.create_collection_with_config(
-                        collection_name, vector_size, distance
-                    )
+                        resolved_size = vector_size or model_info.vector_size
+                        if vector_size and vector_size != model_info.vector_size:
+                            if vector_size > model_info.vector_size:
+                                return failure_from(
+                                    acc,
+                                    code="invalid_vector_size",
+                                    message=f"Requested vector_size {vector_size} exceeds model max {model_info.vector_size} for '{embedding_model}'.",
+                                    profile=profile,
+                                )
+                            acc.warnings.append(
+                                f"Using custom vector_size {vector_size} (model supports up to {model_info.vector_size})"
+                            )
+                        vector_size = resolved_size
 
-                    if success:
-                        return f"Successfully created collection '{collection_name}' with vector size {vector_size}, {distance} distance, and embedding model '{embedding_model}'"
-                    else:
-                        return f"Failed to create collection '{collection_name}'"
+                        ok = await self.qdrant_connector.create_collection_with_config(
+                            collection_name, vector_size, distance
+                        )
+                        if not ok:
+                            return failure_from(acc, code="create_failed", message=f"Failed to create collection '{collection_name}'", profile=profile, retryable=True)
 
-                except Exception as e:
-                    await ctx.debug(f"Error creating collection: {e}")
-                    return f"Error creating collection: {str(e)}"
+                        return success_from(
+                            acc,
+                            data={
+                                "collection_name": collection_name,
+                                "vector_size": vector_size,
+                                "distance": distance,
+                                "embedding_model": embedding_model,
+                                "hybrid": False,
+                            },
+                            profile=profile,
+                        )
+                    except Exception as e:
+                        await ctx.debug(f"Error creating collection: {e}")
+                        return failure_from(acc, code="internal_error", message=str(e), profile=profile, retryable=True)
 
             @self._profile_tool(description=self.tool_settings.tool_create_hybrid_collection_description)
             async def create_hybrid_collection(
@@ -343,35 +361,46 @@ class QdrantMCPServer(FastMCP):
                 embedding_model: Annotated[str, Field(description="Dense embedding model, e.g. 'Qwen/Qwen3-Embedding-8B'")],
                 sparse_model: Annotated[str, Field(description="Sparse model, default 'Qdrant/bm25'")] = "Qdrant/bm25",
                 distance: Annotated[str, Field(description="Distance metric")] = "cosine",
-            ) -> str:
+            ) -> dict:
                 """Create a collection with both dense and sparse vector slots for RRF hybrid search."""
-                try:
-                    info = self.embedding_manager.get_model_info(embedding_model)
-                    if not info:
-                        return f"Unknown dense model: '{embedding_model}'."
-                    dense_provider = self.embedding_manager.create_provider_for_model(embedding_model)
-                    from mcp_server_qdrant.embeddings.sparse import SparseEmbeddingProvider
-                    sparse_provider = SparseEmbeddingProvider(sparse_model)
-                    self._sparse_provider = sparse_provider
+                from mcp_server_qdrant.mcp_runtime.envelope import envelope_context, success_from, failure_from
+                profile = self.active_profile.name.lower()
+                with envelope_context(profile) as acc:
+                    try:
+                        info = self.embedding_manager.get_model_info(embedding_model)
+                        if not info:
+                            return failure_from(acc, code="unknown_embedding_model", message=f"Unknown dense model: '{embedding_model}'.", profile=profile)
+                        dense_provider = self.embedding_manager.create_provider_for_model(embedding_model)
+                        from mcp_server_qdrant.embeddings.sparse import SparseEmbeddingProvider
+                        sparse_provider = SparseEmbeddingProvider(sparse_model)
+                        self._sparse_provider = sparse_provider
 
-                    success = await self.qdrant_connector.create_hybrid_collection(
-                        collection_name=collection_name,
-                        dense_size=info.vector_size,
-                        dense_vector_name=dense_provider.get_vector_name(),
-                        sparse_vector_name=sparse_provider.get_vector_name(),
-                        distance=distance,
-                    )
-                    if not success:
-                        return f"Failed to create hybrid collection '{collection_name}'"
-                    await self.qdrant_connector.ensure_macos_metadata_indexes(collection_name)
-                    return (
-                        f"Created hybrid collection '{collection_name}' with dense={embedding_model} "
-                        f"({info.vector_size}D) + sparse={sparse_model}. "
-                        f"Use search_documents(mode='hybrid') to query."
-                    )
-                except Exception as e:
-                    await ctx.debug(f"Error creating hybrid collection: {e}")
-                    return f"Error: {str(e)}"
+                        ok = await self.qdrant_connector.create_hybrid_collection(
+                            collection_name=collection_name,
+                            dense_size=info.vector_size,
+                            dense_vector_name=dense_provider.get_vector_name(),
+                            sparse_vector_name=sparse_provider.get_vector_name(),
+                            distance=distance,
+                        )
+                        if not ok:
+                            return failure_from(acc, code="create_failed", message=f"Failed to create hybrid collection '{collection_name}'", profile=profile, retryable=True)
+                        await self.qdrant_connector.ensure_macos_metadata_indexes(collection_name)
+
+                        return success_from(
+                            acc,
+                            data={
+                                "collection_name": collection_name,
+                                "vector_size": info.vector_size,
+                                "distance": distance,
+                                "embedding_model": embedding_model,
+                                "sparse_model": sparse_model,
+                                "hybrid": True,
+                            },
+                            profile=profile,
+                        )
+                    except Exception as e:
+                        await ctx.debug(f"Error creating hybrid collection: {e}")
+                        return failure_from(acc, code="internal_error", message=str(e), profile=profile, retryable=True)
 
             @self._profile_tool(description=self.tool_settings.tool_delete_collection_description)
             async def delete_collection(
@@ -464,70 +493,103 @@ class QdrantMCPServer(FastMCP):
             filter: Annotated[dict | None, Field(description="High-level filter: {must, should, must_not}")] = None,
             mode: Annotated[str, Field(description="'dense' | 'hybrid' | 'rerank' | 'late_interaction' (reserved)")] = "dense",
             reranker_model: Annotated[str | None, Field(description="Reranker for mode='rerank' (default Xenova/ms-marco-MiniLM-L-6-v2)")] = None,
-        ) -> list[str]:
+        ) -> dict:
             """Document-level grouped search — best chunk per file, ranked by document score."""
-            try:
-                from mcp_server_qdrant.search.document_search import search_documents_grouped
-                from mcp_server_qdrant.search.filter_grammar import compile_filter
-                from mcp_server_qdrant.search.retrieval_mode import RetrievalMode
-                from mcp_server_qdrant.search.reranker import build_default_reranker
+            from mcp_server_qdrant.mcp_runtime.envelope import envelope_context, success_from, failure_from
+            from mcp_server_qdrant.search.document_search import search_documents_grouped
+            from mcp_server_qdrant.search.filter_grammar import compile_filter
+            from mcp_server_qdrant.search.retrieval_mode import RetrievalMode
+            from mcp_server_qdrant.search.reranker import build_default_reranker
 
-                rmode = RetrievalMode.parse(mode)
-                qfilter = compile_filter(filter) if filter else None
+            profile = self.active_profile.name.lower()
+            with envelope_context(profile) as acc:
+                try:
+                    rmode = RetrievalMode.parse(mode)
+                    if rmode == RetrievalMode.LATE_INTERACTION:
+                        return failure_from(
+                            acc,
+                            code="mode_not_supported",
+                            message="Mode 'late_interaction' is reserved for future ColBERT-style retrieval.",
+                            profile=profile,
+                        )
 
-                use_sparse = rmode in (RetrievalMode.HYBRID, RetrievalMode.RERANK)
-                sparse_provider = self.get_sparse_provider() if use_sparse else None
+                    qfilter = compile_filter(filter) if filter else None
+                    use_sparse = rmode in (RetrievalMode.HYBRID, RetrievalMode.RERANK)
+                    sparse_provider = self.get_sparse_provider() if use_sparse else None
 
-                reranker = None
-                if rmode == RetrievalMode.RERANK:
-                    reranker = build_default_reranker(reranker_model or "Xenova/ms-marco-MiniLM-L-6-v2")
-                if rmode == RetrievalMode.LATE_INTERACTION:
-                    return ["Mode 'late_interaction' is reserved for future ColBERT-style retrieval."]
+                    reranker = None
+                    if rmode == RetrievalMode.RERANK:
+                        reranker_name = reranker_model or "Xenova/ms-marco-MiniLM-L-6-v2"
+                        reranker = build_default_reranker(reranker_name)
+                        acc.stats["reranker_model"] = reranker_name
 
-                docs = await search_documents_grouped(
-                    self.qdrant_connector,
-                    query=query,
-                    collection_name=collection_name,
-                    limit=limit,
-                    chunks_per_document=chunks_per_document,
-                    query_filter=qfilter,
-                    sparse_provider=sparse_provider,
-                    reranker=reranker,
-                )
-                if not docs:
-                    return [f"No matching documents in '{collection_name}' for '{query}'"]
-
-                output = [f"Found {len(docs)} document(s) for '{query}':"]
-                for d in docs:
-                    header = (
-                        f"📄 [Score: {d['score']:.4f}] "
-                        f"{d.get('filename') or d.get('document_id')}"
+                    docs = await search_documents_grouped(
+                        self.qdrant_connector,
+                        query=query,
+                        collection_name=collection_name,
+                        limit=limit,
+                        chunks_per_document=chunks_per_document,
+                        query_filter=qfilter,
+                        sparse_provider=sparse_provider,
+                        reranker=reranker,
                     )
-                    if d.get("path"):
-                        header += f" — {d['path']}"
-                    output.append(header)
-                    for chunk in d["chunks"]:
-                        idx = chunk.get("chunk_index")
-                        idx_str = f" (chunk {idx})" if idx is not None else ""
-                        snippet = chunk["content"][:500]
-                        output.append(f"  [{chunk['score']:.4f}{idx_str}] {snippet}")
-                return output
-            except Exception as e:
-                await ctx.debug(f"Error in search_documents: {e}")
-                return [f"Error: {str(e)}"]
+                    acc.stats["raw_chunks_fetched"] = sum(len(d["chunks"]) for d in docs)
+                    acc.stats["documents_returned"] = len(docs)
+
+                    results = []
+                    for d in docs:
+                        best = d["chunks"][0] if d["chunks"] else None
+                        snippet = (best["content"][:500] if best else "")
+                        results.append({
+                            "document_id": d["document_id"],
+                            "path": d.get("path") or "",
+                            "filename": d.get("filename") or "",
+                            "title": d.get("title"),
+                            "snippet": snippet,
+                            "score": d["score"],
+                            "chunk_count": len(d["chunks"]),
+                            "metadata": (best["metadata"] if best else {}) or {},
+                        })
+
+                    return success_from(
+                        acc,
+                        data={
+                            "query": query,
+                            "mode": rmode.value,
+                            "grouped_by_document": True,
+                            "results": results,
+                        },
+                        profile=profile,
+                    )
+                except ValueError as e:
+                    return failure_from(acc, code="invalid_argument", message=str(e), profile=profile)
+                except Exception as e:
+                    await ctx.debug(f"Error in search_documents: {e}")
+                    return failure_from(acc, code="internal_error", message=str(e), profile=profile, retryable=True)
 
         @self._profile_tool(description=self.tool_settings.tool_bootstrap_indexes_description)
         async def bootstrap_collection_indexes(
             ctx: Context,
             collection_name: Annotated[str, Field(description="Collection to index")],
-        ) -> str:
+        ) -> dict:
             """Create all macOS metadata payload indexes on a collection up front."""
-            try:
-                await self.qdrant_connector.ensure_macos_metadata_indexes(collection_name)
-                return f"Bootstrapped macOS metadata indexes on '{collection_name}'."
-            except Exception as e:
-                await ctx.debug(f"Error bootstrapping indexes: {e}")
-                return f"Error: {str(e)}"
+            from mcp_server_qdrant.mcp_runtime.envelope import envelope_context, success_from, failure_from
+            from mcp_server_qdrant.ingest.macos_metadata import MACOS_INDEX_FIELDS
+            profile = self.active_profile.name.lower()
+            with envelope_context(profile) as acc:
+                try:
+                    await self.qdrant_connector.ensure_macos_metadata_indexes(collection_name)
+                    return success_from(
+                        acc,
+                        data={
+                            "collection": collection_name,
+                            "indexes_ensured": [f for f, _ in MACOS_INDEX_FIELDS],
+                        },
+                        profile=profile,
+                    )
+                except Exception as e:
+                    await ctx.debug(f"Error bootstrapping indexes: {e}")
+                    return failure_from(acc, code="internal_error", message=str(e), profile=profile, retryable=True)
 
         @self._profile_tool(description=self.tool_settings.tool_hybrid_search_description)
         async def hybrid_search(
@@ -651,122 +713,35 @@ class QdrantMCPServer(FastMCP):
             collection_name: Annotated[str, Field(description="Collection to store chunks in")],
             extra_metadata: Annotated[str | None, Field(description="Optional extra metadata as JSON string")] = None,
             mode: Annotated[str, Field(description="'dense' (default) or 'hybrid' (collection must be hybrid)")] = "dense",
-        ) -> str:
+        ) -> dict:
             """Ingest a single file: extract text, collect macOS metadata, chunk and store."""
+            from mcp_server_qdrant.mcp_runtime.envelope import envelope_context, success_from, failure_from
             from mcp_server_qdrant.ingest.extractor import extract_text, build_chunks, SUPPORTED_EXTENSIONS
             from mcp_server_qdrant.ingest.macos_metadata import get_macos_metadata
             from mcp_server_qdrant.ingest.document_id import compute_document_id
             from pathlib import Path
 
-            path = Path(file_path).resolve()
-            if not path.exists():
-                return f"File not found: {file_path}"
-            if path.suffix.lower() not in SUPPORTED_EXTENSIONS:
-                return f"Unsupported file type '{path.suffix}'. Supported: {', '.join(sorted(SUPPORTED_EXTENSIONS))}"
-
-            try:
-                extra = {}
-                if extra_metadata:
-                    try:
-                        extra = json.loads(extra_metadata)
-                    except json.JSONDecodeError:
-                        return f"Invalid extra_metadata JSON: {extra_metadata}"
-
-                file_meta = get_macos_metadata(str(path))
-                doc = extract_text(str(path))
-                file_meta["has_text"] = bool(doc.text)
-                file_meta["extractor_used"] = doc.extractor_used
-                file_meta["char_count"] = doc.char_count
-                if doc.page_count is not None:
-                    file_meta["page_count"] = doc.page_count
-                file_meta["ingested_at"] = datetime.now(timezone.utc).isoformat()
-                file_meta["document_id"] = compute_document_id(str(path))
-                file_meta["parent_path"] = str(path.parent)
-                file_meta.update(extra)
-
-                if doc.error and not doc.text:
-                    return f"Extraction failed for '{path.name}': {doc.error}"
-
-                chunks = build_chunks(doc, file_meta)
-                if not chunks:
-                    return f"No text extracted from '{path.name}'"
-
-                await self.qdrant_connector.ensure_macos_metadata_indexes(collection_name)
-
-                batch_entries = [
-                    BatchEntry(content=chunk.text, metadata=chunk.metadata)
-                    for chunk in chunks
-                ]
-                if mode == "hybrid":
-                    stored = await self.qdrant_connector.batch_store_hybrid(
-                        batch_entries, collection_name, self.get_sparse_provider()
+            profile = self.active_profile.name.lower()
+            with envelope_context(profile) as acc:
+                path = Path(file_path).resolve()
+                if not path.exists():
+                    return failure_from(acc, code="file_not_found", message=f"File not found: {file_path}", profile=profile)
+                if path.suffix.lower() not in SUPPORTED_EXTENSIONS:
+                    return failure_from(
+                        acc,
+                        code="unsupported_file_type",
+                        message=f"Unsupported file type '{path.suffix}'. Supported: {', '.join(sorted(SUPPORTED_EXTENSIONS))}",
+                        profile=profile,
                     )
-                else:
-                    stored = await self.qdrant_connector.batch_store(batch_entries, collection_name)
 
-                stats = f"{stored} chunk(s) stored"
-                if doc.error:
-                    stats += f" (warning: {doc.error})"
-                return (
-                    f"Ingested '{path.name}': {stats}. "
-                    f"Extractor: {doc.extractor_used}, {doc.char_count:,} chars"
-                    + (f", {doc.page_count} pages" if doc.page_count else "")
-                    + "."
-                )
-            except Exception as e:
-                await ctx.debug(f"Error ingesting file: {e}")
-                return f"Error ingesting '{file_path}': {str(e)}"
-
-        @self._profile_tool(description=self.tool_settings.tool_ingest_folder_description)
-        async def ingest_folder(
-            ctx: Context,
-            folder_path: Annotated[str, Field(description="Absolute path to the folder to ingest")],
-            collection_name: Annotated[str, Field(description="Collection to store chunks in")],
-            recursive: Annotated[bool, Field(description="Recurse into subdirectories")] = True,
-            skip_hidden: Annotated[bool, Field(description="Skip hidden files and directories (starting with .)")] = True,
-            extra_metadata: Annotated[str | None, Field(description="Optional extra metadata as JSON string applied to all files")] = None,
-            mode: Annotated[str, Field(description="'dense' (default) or 'hybrid' (collection must be hybrid)")] = "dense",
-        ) -> str:
-            """Recursively ingest all supported files in a folder."""
-            from mcp_server_qdrant.ingest.extractor import extract_text, build_chunks, SUPPORTED_EXTENSIONS
-            from mcp_server_qdrant.ingest.macos_metadata import get_macos_metadata
-            from mcp_server_qdrant.ingest.document_id import compute_document_id
-            from datetime import datetime, timezone
-            from pathlib import Path
-
-            folder = Path(folder_path).resolve()
-            if not folder.exists():
-                return f"Folder not found: {folder_path}"
-            if not folder.is_dir():
-                return f"Not a directory: {folder_path}"
-
-            extra = {}
-            if extra_metadata:
                 try:
-                    extra = json.loads(extra_metadata)
-                except json.JSONDecodeError:
-                    return f"Invalid extra_metadata JSON: {extra_metadata}"
+                    extra = {}
+                    if extra_metadata:
+                        try:
+                            extra = json.loads(extra_metadata)
+                        except json.JSONDecodeError:
+                            return failure_from(acc, code="invalid_metadata_json", message=f"Invalid extra_metadata JSON: {extra_metadata}", profile=profile)
 
-            pattern = "**/*" if recursive else "*"
-            all_files = [
-                p for p in folder.glob(pattern)
-                if p.is_file()
-                and p.suffix.lower() in SUPPORTED_EXTENSIONS
-                and (not skip_hidden or not any(part.startswith(".") for part in p.parts))
-            ]
-
-            if not all_files:
-                return f"No supported files found in '{folder_path}'"
-
-            await self.qdrant_connector.ensure_macos_metadata_indexes(collection_name)
-
-            total_chunks = 0
-            total_files = 0
-            errors: list[str] = []
-            ingested_at = datetime.now(timezone.utc).isoformat()
-
-            for path in sorted(all_files):
-                try:
                     file_meta = get_macos_metadata(str(path))
                     doc = extract_text(str(path))
                     file_meta["has_text"] = bool(doc.text)
@@ -774,16 +749,22 @@ class QdrantMCPServer(FastMCP):
                     file_meta["char_count"] = doc.char_count
                     if doc.page_count is not None:
                         file_meta["page_count"] = doc.page_count
-                    file_meta["ingested_at"] = ingested_at
+                    file_meta["ingested_at"] = datetime.now(timezone.utc).isoformat()
                     file_meta["document_id"] = compute_document_id(str(path))
                     file_meta["parent_path"] = str(path.parent)
                     file_meta.update(extra)
 
-                    if not doc.text:
-                        errors.append(f"{path.name}: no text extracted ({doc.error or 'empty'})")
-                        continue
+                    if doc.error and not doc.text:
+                        return failure_from(acc, code="extraction_failed", message=f"Extraction failed for '{path.name}': {doc.error}", profile=profile)
+                    if doc.error:
+                        acc.warnings.append(f"extractor_warning: {doc.error}")
 
                     chunks = build_chunks(doc, file_meta)
+                    if not chunks:
+                        return failure_from(acc, code="empty_extraction", message=f"No text extracted from '{path.name}'", profile=profile)
+
+                    await self.qdrant_connector.ensure_macos_metadata_indexes(collection_name)
+
                     batch_entries = [
                         BatchEntry(content=chunk.text, metadata=chunk.metadata)
                         for chunk in chunks
@@ -794,20 +775,142 @@ class QdrantMCPServer(FastMCP):
                         )
                     else:
                         stored = await self.qdrant_connector.batch_store(batch_entries, collection_name)
-                    total_chunks += stored
-                    total_files += 1
-                except Exception as e:
-                    errors.append(f"{path.name}: {e}")
 
-            summary = (
-                f"Ingested {total_files}/{len(all_files)} files → "
-                f"{total_chunks} chunks stored in '{collection_name}'."
-            )
-            if errors:
-                summary += f" Errors ({len(errors)}): " + "; ".join(errors[:5])
-                if len(errors) > 5:
-                    summary += f" ...and {len(errors) - 5} more."
-            return summary
+                    acc.stats.update({
+                        "extractor_used": doc.extractor_used,
+                        "char_count": doc.char_count,
+                        "page_count": doc.page_count,
+                        "chunks_stored": stored,
+                        "mode": mode,
+                    })
+                    return success_from(
+                        acc,
+                        data={
+                            "file_path": str(path),
+                            "filename": path.name,
+                            "document_id": file_meta["document_id"],
+                            "collection": collection_name,
+                            "chunks_stored": stored,
+                            "extractor_used": doc.extractor_used,
+                            "char_count": doc.char_count,
+                            "page_count": doc.page_count,
+                        },
+                        profile=profile,
+                    )
+                except Exception as e:
+                    await ctx.debug(f"Error ingesting file: {e}")
+                    return failure_from(acc, code="internal_error", message=str(e), profile=profile, retryable=True)
+
+        @self._profile_tool(description=self.tool_settings.tool_ingest_folder_description)
+        async def ingest_folder(
+            ctx: Context,
+            folder_path: Annotated[str, Field(description="Absolute path to the folder to ingest")],
+            collection_name: Annotated[str, Field(description="Collection to store chunks in")],
+            recursive: Annotated[bool, Field(description="Recurse into subdirectories")] = True,
+            skip_hidden: Annotated[bool, Field(description="Skip hidden files and directories (starting with .)")] = True,
+            extra_metadata: Annotated[str | None, Field(description="Optional extra metadata as JSON string applied to all files")] = None,
+            mode: Annotated[str, Field(description="'dense' (default) or 'hybrid' (collection must be hybrid)")] = "dense",
+        ) -> dict:
+            """Recursively ingest all supported files in a folder."""
+            from mcp_server_qdrant.mcp_runtime.envelope import envelope_context, success_from, failure_from
+            from mcp_server_qdrant.ingest.extractor import extract_text, build_chunks, SUPPORTED_EXTENSIONS
+            from mcp_server_qdrant.ingest.macos_metadata import get_macos_metadata
+            from mcp_server_qdrant.ingest.document_id import compute_document_id
+            from datetime import datetime, timezone
+            from pathlib import Path
+
+            profile = self.active_profile.name.lower()
+            with envelope_context(profile) as acc:
+                folder = Path(folder_path).resolve()
+                if not folder.exists():
+                    return failure_from(acc, code="folder_not_found", message=f"Folder not found: {folder_path}", profile=profile)
+                if not folder.is_dir():
+                    return failure_from(acc, code="not_a_directory", message=f"Not a directory: {folder_path}", profile=profile)
+
+                extra = {}
+                if extra_metadata:
+                    try:
+                        extra = json.loads(extra_metadata)
+                    except json.JSONDecodeError:
+                        return failure_from(acc, code="invalid_metadata_json", message=f"Invalid extra_metadata JSON: {extra_metadata}", profile=profile)
+
+                pattern = "**/*" if recursive else "*"
+                all_files = [
+                    p for p in folder.glob(pattern)
+                    if p.is_file()
+                    and p.suffix.lower() in SUPPORTED_EXTENSIONS
+                    and (not skip_hidden or not any(part.startswith(".") for part in p.parts))
+                ]
+
+                if not all_files:
+                    return success_from(
+                        acc,
+                        data={
+                            "folder": str(folder),
+                            "files_processed": 0,
+                            "files_total": 0,
+                            "chunks_stored": 0,
+                            "errors": [],
+                        },
+                        profile=profile,
+                    )
+
+                await self.qdrant_connector.ensure_macos_metadata_indexes(collection_name)
+
+                total_chunks = 0
+                total_files = 0
+                errors: list[dict] = []
+                ingested_at = datetime.now(timezone.utc).isoformat()
+
+                for path in sorted(all_files):
+                    try:
+                        file_meta = get_macos_metadata(str(path))
+                        doc = extract_text(str(path))
+                        file_meta["has_text"] = bool(doc.text)
+                        file_meta["extractor_used"] = doc.extractor_used
+                        file_meta["char_count"] = doc.char_count
+                        if doc.page_count is not None:
+                            file_meta["page_count"] = doc.page_count
+                        file_meta["ingested_at"] = ingested_at
+                        file_meta["document_id"] = compute_document_id(str(path))
+                        file_meta["parent_path"] = str(path.parent)
+                        file_meta.update(extra)
+
+                        if not doc.text:
+                            errors.append({"file": str(path), "code": "empty_extraction", "message": doc.error or "empty"})
+                            continue
+
+                        chunks = build_chunks(doc, file_meta)
+                        batch_entries = [
+                            BatchEntry(content=chunk.text, metadata=chunk.metadata)
+                            for chunk in chunks
+                        ]
+                        if mode == "hybrid":
+                            stored = await self.qdrant_connector.batch_store_hybrid(
+                                batch_entries, collection_name, self.get_sparse_provider()
+                            )
+                        else:
+                            stored = await self.qdrant_connector.batch_store(batch_entries, collection_name)
+                        total_chunks += stored
+                        total_files += 1
+                    except Exception as e:
+                        errors.append({"file": str(path), "code": "internal_error", "message": str(e)})
+
+                if errors:
+                    acc.warnings.append(f"{len(errors)} file(s) failed; see data.errors")
+
+                acc.stats["mode"] = mode
+                return success_from(
+                    acc,
+                    data={
+                        "folder": str(folder),
+                        "files_processed": total_files,
+                        "files_total": len(all_files),
+                        "chunks_stored": total_chunks,
+                        "errors": errors[:50],
+                    },
+                    profile=profile,
+                )
 
     def setup_resources(self):
         """Setup enhanced MCP resources."""
