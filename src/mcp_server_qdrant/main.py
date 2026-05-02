@@ -1,50 +1,104 @@
+"""
+Entry point for the `mcp-server-qdrant` CLI.
+
+Supports two MCP transports:
+
+* ``stdio`` (default) — single-client, per-process. Best for Claude Desktop,
+  LM Studio, or any client that spawns the server.
+* ``streamable-http`` — long-lived local server that multiple agents can share
+  on the same machine. Binds to ``127.0.0.1`` by default, validates the
+  ``Origin`` header to mitigate DNS rebinding, and supports an optional bearer
+  token via ``MCP_HTTP_AUTH_TOKEN``.
+
+Configuration precedence: CLI flag > environment variable > default.
+Env vars: ``MCP_TRANSPORT``, ``MCP_HOST``, ``MCP_PORT``, ``MCP_HTTP_AUTH_TOKEN``,
+``MCP_HTTP_ALLOWED_ORIGINS``.
+"""
+
 import argparse
+import os
 import signal
 import sys
+
 from mcp_server_qdrant.docker_utils import start_qdrant_container, stop_qdrant_container
 
 
-def main():
-    """
-    Main entry point for the mcp-server-qdrant script defined
-    in pyproject.toml. It runs the MCP server with a specific transport
-    protocol.
-    """
+def _env_or(default: str, *names: str) -> str:
+    for n in names:
+        v = os.getenv(n)
+        if v:
+            return v
+    return default
 
-    # Parse the command-line arguments to determine the transport protocol.
+
+def main() -> None:
     parser = argparse.ArgumentParser(description="mcp-server-qdrant")
     parser.add_argument(
         "--transport",
-        choices=["stdio", "sse", "streamable-http"],
-        default="stdio",
+        choices=["stdio", "sse", "streamable-http", "http"],
+        default=_env_or("stdio", "MCP_TRANSPORT"),
+        help="MCP transport (default: stdio). 'http' is an alias for 'streamable-http'.",
+    )
+    parser.add_argument(
+        "--host",
+        default=_env_or("127.0.0.1", "MCP_HOST"),
+        help="HTTP bind address (default: 127.0.0.1; only loopback is recommended).",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=int(_env_or("8000", "MCP_PORT", "FASTMCP_PORT")),
+        help="HTTP port (default: 8000).",
+    )
+    parser.add_argument(
+        "--auth-token",
+        default=os.getenv("MCP_HTTP_AUTH_TOKEN"),
+        help="Bearer token required on every HTTP request when set.",
     )
     args = parser.parse_args()
 
-    # Start the Qdrant Docker container
+    # Normalize transport alias
+    transport = "streamable-http" if args.transport == "http" else args.transport
+
+    # Auto-start local Qdrant container (no-op if external Qdrant is configured).
     start_qdrant_container()
 
-    # Define a signal handler for graceful shutdown
     def signal_handler(sig, frame):
-        print(f"\nReceived signal {sig}, shutting down gracefully...")
+        print(f"\nReceived signal {sig}, shutting down gracefully...", file=sys.stderr)
         stop_qdrant_container()
         sys.exit(0)
 
-    # Register the signal handlers
-    signal.signal(signal.SIGINT, signal_handler)  # Ctrl+C
-    signal.signal(signal.SIGTERM, signal_handler) # kill command
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
 
-    # Import is done here to make sure environment variables are loaded
-    # only after we make the changes.
+    # Import after env is in place so settings pick up the right values.
     from mcp_server_qdrant.server import mcp
 
     try:
-        mcp.run(transport=args.transport)
+        if transport == "stdio":
+            mcp.run(transport="stdio")
+        elif transport == "sse":
+            mcp.run(transport="sse", host=args.host, port=args.port)
+        else:
+            # streamable-http: attach Origin validation + optional Bearer auth middleware
+            from mcp_server_qdrant.mcp_runtime.http_security import build_middleware_stack
+
+            middleware = build_middleware_stack(auth_token=args.auth_token)
+            print(
+                f"[mcp-server-qdrant] Streamable HTTP on http://{args.host}:{args.port}/mcp/ "
+                f"(auth={'on' if args.auth_token or os.getenv('MCP_HTTP_AUTH_TOKEN') else 'off'})",
+                file=sys.stderr,
+            )
+
+            # Build the app with middleware then run via uvicorn
+            import uvicorn
+            app = mcp.http_app(middleware=middleware, transport="streamable-http")
+            uvicorn.run(app, host=args.host, port=args.port, log_level="info")
     except KeyboardInterrupt:
-        # This handles cases where Ctrl+C might not be caught by signal_handler
-        print("\nKeyboardInterrupt detected, shutting down...")
+        print("\nKeyboardInterrupt detected, shutting down...", file=sys.stderr)
         stop_qdrant_container()
         sys.exit(0)
     except Exception as e:
-        print(f"An unexpected error occurred: {e}")
+        print(f"An unexpected error occurred: {e}", file=sys.stderr)
         stop_qdrant_container()
         sys.exit(1)
