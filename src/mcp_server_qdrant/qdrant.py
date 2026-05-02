@@ -554,6 +554,147 @@ class QdrantConnector:
             results.append((entry, point.score))
         return results
 
+    async def create_hybrid_collection(
+        self,
+        collection_name: str,
+        dense_size: int,
+        dense_vector_name: str,
+        sparse_vector_name: str,
+        distance: str = "cosine",
+    ) -> bool:
+        """
+        Create a collection with both a dense vector slot and a sparse vector slot,
+        suitable for hybrid retrieval with RRF fusion.
+        """
+        try:
+            distance_map = {
+                "cosine": models.Distance.COSINE,
+                "dot": models.Distance.DOT,
+                "euclidean": models.Distance.EUCLID,
+                "manhattan": models.Distance.MANHATTAN,
+            }
+            distance_metric = distance_map.get(distance.lower(), models.Distance.COSINE)
+
+            await self._client.create_collection(
+                collection_name=collection_name,
+                vectors_config={
+                    dense_vector_name: models.VectorParams(
+                        size=dense_size,
+                        distance=distance_metric,
+                    ),
+                },
+                sparse_vectors_config={
+                    sparse_vector_name: models.SparseVectorParams(
+                        modifier=models.Modifier.IDF,
+                    ),
+                },
+            )
+
+            if self._field_indexes:
+                for field_name, field_type in self._field_indexes.items():
+                    await self._client.create_payload_index(
+                        collection_name=collection_name,
+                        field_name=field_name,
+                        field_schema=field_type,
+                    )
+            return True
+        except Exception as e:
+            logger.error(f"Error creating hybrid collection {collection_name}: {e}")
+            return False
+
+    async def batch_store_hybrid(
+        self,
+        entries: list[BatchEntry],
+        collection_name: str,
+        sparse_provider,
+    ) -> int:
+        """Store entries with both dense and sparse vectors."""
+        try:
+            documents = [e.content for e in entries]
+            dense = await self._embedding_provider.embed_documents(documents)
+            sparse = await sparse_provider.embed_documents(documents)
+
+            dense_name = self._embedding_provider.get_vector_name()
+            sparse_name = sparse_provider.get_vector_name()
+
+            points = []
+            for i, entry in enumerate(entries):
+                if entry.id:
+                    try:
+                        point_id = str(uuid.UUID(entry.id)).replace("-", "")
+                    except ValueError:
+                        point_id = uuid.uuid5(uuid.NAMESPACE_DNS, entry.id).hex
+                else:
+                    point_id = uuid.uuid4().hex
+
+                points.append(models.PointStruct(
+                    id=point_id,
+                    payload={"document": entry.content, METADATA_PATH: entry.metadata or {}},
+                    vector={
+                        dense_name: dense[i],
+                        sparse_name: models.SparseVector(
+                            indices=sparse[i]["indices"],
+                            values=sparse[i]["values"],
+                        ),
+                    },
+                ))
+
+            await self._client.upsert(collection_name=collection_name, points=points, wait=True)
+            return len(entries)
+        except Exception as e:
+            logger.error(f"Error in batch_store_hybrid: {e}")
+            return 0
+
+    async def search_hybrid_rrf(
+        self,
+        query: str,
+        collection_name: str,
+        sparse_provider,
+        *,
+        limit: int = 10,
+        query_filter: models.Filter | None = None,
+        prefetch_limit: int = 50,
+    ) -> list[tuple[Entry, float]]:
+        """
+        Hybrid search using Qdrant's Query API with prefetch + Reciprocal Rank Fusion.
+        Runs dense and sparse retrieval in parallel server-side, then fuses ranks.
+        """
+        try:
+            dense_vector = await self._embedding_provider.embed_query(query)
+            sparse_vector = await sparse_provider.embed_query(query)
+
+            dense_name = self._embedding_provider.get_vector_name()
+            sparse_name = sparse_provider.get_vector_name()
+
+            response = await self._client.query_points(
+                collection_name=collection_name,
+                prefetch=[
+                    models.Prefetch(
+                        query=dense_vector,
+                        using=dense_name,
+                        limit=prefetch_limit,
+                        filter=query_filter,
+                    ),
+                    models.Prefetch(
+                        query=models.SparseVector(
+                            indices=sparse_vector["indices"],
+                            values=sparse_vector["values"],
+                        ),
+                        using=sparse_name,
+                        limit=prefetch_limit,
+                        filter=query_filter,
+                    ),
+                ],
+                query=models.FusionQuery(fusion=models.Fusion.RRF),
+                limit=limit,
+                with_payload=True,
+                with_vectors=False,
+            )
+            return self._process_scored_results(response.points)
+        except Exception as e:
+            logger.error(f"Error in search_hybrid_rrf: {e}")
+            return []
+
     async def ensure_macos_metadata_indexes(self, collection_name: str) -> None:
         """
         Idempotently create payload indexes for standard macOS file metadata fields.

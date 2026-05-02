@@ -25,6 +25,9 @@ from mcp_server_qdrant.enhanced_tool_descriptions import (
     DEFAULT_TOOL_SET_COLLECTION_EMBEDDING_MODEL_IMPL_DESCRIPTION,
     DEFAULT_TOOL_INGEST_FILE_DESCRIPTION,
     DEFAULT_TOOL_INGEST_FOLDER_DESCRIPTION,
+    DEFAULT_TOOL_SEARCH_DOCUMENTS_DESCRIPTION,
+    DEFAULT_TOOL_BOOTSTRAP_INDEXES_DESCRIPTION,
+    DEFAULT_TOOL_CREATE_HYBRID_COLLECTION_DESCRIPTION,
 )
 
 METADATA_PATH = "metadata"
@@ -90,6 +93,18 @@ class ToolSettings(BaseSettings):
     tool_ingest_folder_description: str = Field(
         default=DEFAULT_TOOL_INGEST_FOLDER_DESCRIPTION,
         validation_alias="TOOL_INGEST_FOLDER_DESCRIPTION",
+    )
+    tool_search_documents_description: str = Field(
+        default=DEFAULT_TOOL_SEARCH_DOCUMENTS_DESCRIPTION,
+        validation_alias="TOOL_SEARCH_DOCUMENTS_DESCRIPTION",
+    )
+    tool_bootstrap_indexes_description: str = Field(
+        default=DEFAULT_TOOL_BOOTSTRAP_INDEXES_DESCRIPTION,
+        validation_alias="TOOL_BOOTSTRAP_INDEXES_DESCRIPTION",
+    )
+    tool_create_hybrid_collection_description: str = Field(
+        default=DEFAULT_TOOL_CREATE_HYBRID_COLLECTION_DESCRIPTION,
+        validation_alias="TOOL_CREATE_HYBRID_COLLECTION_DESCRIPTION",
     )
 
 

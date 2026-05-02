@@ -101,3 +101,30 @@ DEFAULT_TOOL_INGEST_FOLDER_DESCRIPTION = (
     "Each file gets macOS Spotlight metadata extracted and stored as filterable payload. "
     "Returns summary of files processed and total chunks stored."
 )
+
+DEFAULT_TOOL_SEARCH_DOCUMENTS_DESCRIPTION = (
+    "Semantic search with file-level grouping and reranking. "
+    "Usage: search_documents(query='...', collection_name='my_docs', limit=10, "
+    "chunks_per_document=1, filter={'must': [{'field':'extension','op':'==','value':'pdf'}]}, "
+    "mode='dense'|'hybrid'|'rerank'). "
+    "Groups chunks by document_id so a single long file does not dominate results, "
+    "returning one summary entry per file with its best representative chunk(s). "
+    "Filter grammar uses must/should/must_not clauses with ops: ==, !=, >, >=, <, <=, any, except. "
+    "mode='hybrid' requires a hybrid collection (see create_hybrid_collection); "
+    "mode='rerank' adds a cross-encoder rerank pass over hybrid candidates."
+)
+
+DEFAULT_TOOL_BOOTSTRAP_INDEXES_DESCRIPTION = (
+    "Create all macOS metadata payload indexes on a collection up front. "
+    "Usage: bootstrap_collection_indexes(collection_name='my_docs'). "
+    "Recommended before bulk ingest of large folders — Qdrant filter-aware HNSW behavior "
+    "improves when indexes exist before vectors are added."
+)
+
+DEFAULT_TOOL_CREATE_HYBRID_COLLECTION_DESCRIPTION = (
+    "Create a collection set up for HYBRID retrieval (dense + sparse vectors with RRF fusion). "
+    "Usage: create_hybrid_collection(collection_name='my_docs_hybrid', "
+    "embedding_model='Qwen/Qwen3-Embedding-8B', sparse_model='Qdrant/bm25'). "
+    "Use search_documents(mode='hybrid') or mode='rerank' to query. "
+    "Best for filename, identifier, exact-phrase, and semantic queries blended together."
+)

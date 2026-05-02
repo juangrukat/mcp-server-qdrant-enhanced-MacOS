@@ -50,6 +50,9 @@ class QdrantMCPServer(FastMCP):
             # Use the default provider from the simplified embedding manager
             self.embedding_provider = self.embedding_manager.get_default_provider()
 
+            # Sparse provider is lazily initialized on first hybrid operation
+            self._sparse_provider = None
+
             # Initialize Qdrant connector with secure connection handling
             self.qdrant_connector = self._create_secure_qdrant_connector()
 
@@ -90,6 +93,13 @@ class QdrantMCPServer(FastMCP):
             self.qdrant_settings.local_path,
             make_indexes(self.qdrant_settings.filterable_fields_dict()),
         )
+
+    def get_sparse_provider(self):
+        """Lazily initialize and cache the sparse embedding provider."""
+        if self._sparse_provider is None:
+            from mcp_server_qdrant.embeddings.sparse import SparseEmbeddingProvider
+            self._sparse_provider = SparseEmbeddingProvider()
+        return self._sparse_provider
 
     def format_entry(self, entry: Entry) -> str:
         """Format an entry for display."""
@@ -294,6 +304,43 @@ class QdrantMCPServer(FastMCP):
                     await ctx.debug(f"Error creating collection: {e}")
                     return f"Error creating collection: {str(e)}"
 
+            @self.tool(description=self.tool_settings.tool_create_hybrid_collection_description)
+            async def create_hybrid_collection(
+                ctx: Context,
+                collection_name: Annotated[str, Field(description="Name of the hybrid collection to create")],
+                embedding_model: Annotated[str, Field(description="Dense embedding model, e.g. 'Qwen/Qwen3-Embedding-8B'")],
+                sparse_model: Annotated[str, Field(description="Sparse model, default 'Qdrant/bm25'")] = "Qdrant/bm25",
+                distance: Annotated[str, Field(description="Distance metric")] = "cosine",
+            ) -> str:
+                """Create a collection with both dense and sparse vector slots for RRF hybrid search."""
+                try:
+                    info = self.embedding_manager.get_model_info(embedding_model)
+                    if not info:
+                        return f"Unknown dense model: '{embedding_model}'."
+                    dense_provider = self.embedding_manager.create_provider_for_model(embedding_model)
+                    from mcp_server_qdrant.embeddings.sparse import SparseEmbeddingProvider
+                    sparse_provider = SparseEmbeddingProvider(sparse_model)
+                    self._sparse_provider = sparse_provider
+
+                    success = await self.qdrant_connector.create_hybrid_collection(
+                        collection_name=collection_name,
+                        dense_size=info.vector_size,
+                        dense_vector_name=dense_provider.get_vector_name(),
+                        sparse_vector_name=sparse_provider.get_vector_name(),
+                        distance=distance,
+                    )
+                    if not success:
+                        return f"Failed to create hybrid collection '{collection_name}'"
+                    await self.qdrant_connector.ensure_macos_metadata_indexes(collection_name)
+                    return (
+                        f"Created hybrid collection '{collection_name}' with dense={embedding_model} "
+                        f"({info.vector_size}D) + sparse={sparse_model}. "
+                        f"Use search_documents(mode='hybrid') to query."
+                    )
+                except Exception as e:
+                    await ctx.debug(f"Error creating hybrid collection: {e}")
+                    return f"Error: {str(e)}"
+
             @self.tool(description=self.tool_settings.tool_delete_collection_description)
             async def delete_collection(
                 ctx: Context,
@@ -374,6 +421,81 @@ class QdrantMCPServer(FastMCP):
 
     def setup_advanced_search_tools(self):
         """Setup advanced search and storage tools with enhanced embedding support."""
+
+        @self.tool(description=self.tool_settings.tool_search_documents_description)
+        async def search_documents(
+            ctx: Context,
+            query: Annotated[str, Field(description="Semantic search query")],
+            collection_name: Annotated[str, Field(description="Collection to search")],
+            limit: Annotated[int, Field(description="Number of distinct documents to return")] = 10,
+            chunks_per_document: Annotated[int, Field(description="Best chunks to surface per document")] = 1,
+            filter: Annotated[dict | None, Field(description="High-level filter: {must, should, must_not}")] = None,
+            mode: Annotated[str, Field(description="'dense' | 'hybrid' | 'rerank' | 'late_interaction' (reserved)")] = "dense",
+            reranker_model: Annotated[str | None, Field(description="Reranker for mode='rerank' (default Xenova/ms-marco-MiniLM-L-6-v2)")] = None,
+        ) -> list[str]:
+            """Document-level grouped search — best chunk per file, ranked by document score."""
+            try:
+                from mcp_server_qdrant.search.document_search import search_documents_grouped
+                from mcp_server_qdrant.search.filter_grammar import compile_filter
+                from mcp_server_qdrant.search.retrieval_mode import RetrievalMode
+                from mcp_server_qdrant.search.reranker import build_default_reranker
+
+                rmode = RetrievalMode.parse(mode)
+                qfilter = compile_filter(filter) if filter else None
+
+                use_sparse = rmode in (RetrievalMode.HYBRID, RetrievalMode.RERANK)
+                sparse_provider = self.get_sparse_provider() if use_sparse else None
+
+                reranker = None
+                if rmode == RetrievalMode.RERANK:
+                    reranker = build_default_reranker(reranker_model or "Xenova/ms-marco-MiniLM-L-6-v2")
+                if rmode == RetrievalMode.LATE_INTERACTION:
+                    return ["Mode 'late_interaction' is reserved for future ColBERT-style retrieval."]
+
+                docs = await search_documents_grouped(
+                    self.qdrant_connector,
+                    query=query,
+                    collection_name=collection_name,
+                    limit=limit,
+                    chunks_per_document=chunks_per_document,
+                    query_filter=qfilter,
+                    sparse_provider=sparse_provider,
+                    reranker=reranker,
+                )
+                if not docs:
+                    return [f"No matching documents in '{collection_name}' for '{query}'"]
+
+                output = [f"Found {len(docs)} document(s) for '{query}':"]
+                for d in docs:
+                    header = (
+                        f"📄 [Score: {d['score']:.4f}] "
+                        f"{d.get('filename') or d.get('document_id')}"
+                    )
+                    if d.get("path"):
+                        header += f" — {d['path']}"
+                    output.append(header)
+                    for chunk in d["chunks"]:
+                        idx = chunk.get("chunk_index")
+                        idx_str = f" (chunk {idx})" if idx is not None else ""
+                        snippet = chunk["content"][:500]
+                        output.append(f"  [{chunk['score']:.4f}{idx_str}] {snippet}")
+                return output
+            except Exception as e:
+                await ctx.debug(f"Error in search_documents: {e}")
+                return [f"Error: {str(e)}"]
+
+        @self.tool(description=self.tool_settings.tool_bootstrap_indexes_description)
+        async def bootstrap_collection_indexes(
+            ctx: Context,
+            collection_name: Annotated[str, Field(description="Collection to index")],
+        ) -> str:
+            """Create all macOS metadata payload indexes on a collection up front."""
+            try:
+                await self.qdrant_connector.ensure_macos_metadata_indexes(collection_name)
+                return f"Bootstrapped macOS metadata indexes on '{collection_name}'."
+            except Exception as e:
+                await ctx.debug(f"Error bootstrapping indexes: {e}")
+                return f"Error: {str(e)}"
 
         @self.tool(description=self.tool_settings.tool_hybrid_search_description)
         async def hybrid_search(
@@ -496,6 +618,7 @@ class QdrantMCPServer(FastMCP):
             file_path: Annotated[str, Field(description="Absolute path to the file to ingest")],
             collection_name: Annotated[str, Field(description="Collection to store chunks in")],
             extra_metadata: Annotated[str | None, Field(description="Optional extra metadata as JSON string")] = None,
+            mode: Annotated[str, Field(description="'dense' (default) or 'hybrid' (collection must be hybrid)")] = "dense",
         ) -> str:
             """Ingest a single file: extract text, collect macOS metadata, chunk and store."""
             from mcp_server_qdrant.ingest.extractor import extract_text, build_chunks, SUPPORTED_EXTENSIONS
@@ -542,7 +665,12 @@ class QdrantMCPServer(FastMCP):
                     BatchEntry(content=chunk.text, metadata=chunk.metadata)
                     for chunk in chunks
                 ]
-                stored = await self.qdrant_connector.batch_store(batch_entries, collection_name)
+                if mode == "hybrid":
+                    stored = await self.qdrant_connector.batch_store_hybrid(
+                        batch_entries, collection_name, self.get_sparse_provider()
+                    )
+                else:
+                    stored = await self.qdrant_connector.batch_store(batch_entries, collection_name)
 
                 stats = f"{stored} chunk(s) stored"
                 if doc.error:
@@ -565,6 +693,7 @@ class QdrantMCPServer(FastMCP):
             recursive: Annotated[bool, Field(description="Recurse into subdirectories")] = True,
             skip_hidden: Annotated[bool, Field(description="Skip hidden files and directories (starting with .)")] = True,
             extra_metadata: Annotated[str | None, Field(description="Optional extra metadata as JSON string applied to all files")] = None,
+            mode: Annotated[str, Field(description="'dense' (default) or 'hybrid' (collection must be hybrid)")] = "dense",
         ) -> str:
             """Recursively ingest all supported files in a folder."""
             from mcp_server_qdrant.ingest.extractor import extract_text, build_chunks, SUPPORTED_EXTENSIONS
@@ -627,7 +756,12 @@ class QdrantMCPServer(FastMCP):
                         BatchEntry(content=chunk.text, metadata=chunk.metadata)
                         for chunk in chunks
                     ]
-                    stored = await self.qdrant_connector.batch_store(batch_entries, collection_name)
+                    if mode == "hybrid":
+                        stored = await self.qdrant_connector.batch_store_hybrid(
+                            batch_entries, collection_name, self.get_sparse_provider()
+                        )
+                    else:
+                        stored = await self.qdrant_connector.batch_store(batch_entries, collection_name)
                     total_chunks += stored
                     total_files += 1
                 except Exception as e:
