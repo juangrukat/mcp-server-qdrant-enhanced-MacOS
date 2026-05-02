@@ -14,6 +14,7 @@ from mcp_server_qdrant.common.filters import make_indexes
 from mcp_server_qdrant.common.func_tools import make_partial_function
 from mcp_server_qdrant.common.wrap_filters import wrap_filters
 from mcp_server_qdrant.embedding_manager import EnhancedEmbeddingModelManager
+from mcp_server_qdrant.mcp_runtime.profiles import ToolProfile, is_tool_visible
 from mcp_server_qdrant.qdrant import ArbitraryFilter, Entry, QdrantConnector, BatchEntry
 from mcp_server_qdrant.settings import (
     EmbeddingProviderSettings,
@@ -52,6 +53,9 @@ class QdrantMCPServer(FastMCP):
 
             # Sparse provider is lazily initialized on first hybrid operation
             self._sparse_provider = None
+
+            # Active MCP tool profile (minimal | canonical | full)
+            self.active_profile = ToolProfile.parse(qdrant_settings.mcp_tool_profile)
 
             # Initialize Qdrant connector with secure connection handling
             self.qdrant_connector = self._create_secure_qdrant_connector()
@@ -100,6 +104,36 @@ class QdrantMCPServer(FastMCP):
             from mcp_server_qdrant.embeddings.sparse import SparseEmbeddingProvider
             self._sparse_provider = SparseEmbeddingProvider()
         return self._sparse_provider
+
+    def _profile_tool(self, *, name: str | None = None, **kwargs):
+        """
+        Profile-aware replacement for ``self.tool``. If the tool's required
+        profile exceeds the active profile, registration is skipped (the
+        function still defines normally — it just isn't visible to MCP clients).
+
+        Drop-in for ``@self._profile_tool(...)``:
+            ``@self._profile_tool(description="...")`` uses the wrapped fn name
+            ``@self._profile_tool(name="qdrant_find", description="...")`` overrides it
+        """
+        def decorator(fn):
+            check_name = name or fn.__name__
+            if not is_tool_visible(check_name, self.active_profile):
+                logger.info(f"Skipping tool '{check_name}' under profile '{self.active_profile.name.lower()}'")
+                return fn
+            registry_kwargs = dict(kwargs)
+            if name is not None:
+                registry_kwargs["name"] = name
+            return self.tool(**registry_kwargs)(fn)
+        return decorator
+
+    def _register_legacy_tool(self, tool_name: str, fn, description: str) -> None:
+        """Register a tool via the old ``self.tool(name=..., description=...)(fn)`` path,
+        respecting the active profile."""
+        if not is_tool_visible(tool_name, self.active_profile):
+            logger.info(f"Skipping legacy tool '{tool_name}' under profile '{self.active_profile.name.lower()}'")
+            return
+        fn.__name__ = tool_name
+        self.tool(name=tool_name, description=description)(fn)
 
     def format_entry(self, entry: Entry) -> str:
         """Format an entry for display."""
@@ -196,8 +230,7 @@ class QdrantMCPServer(FastMCP):
                 find_tool, {"collection_name": self.qdrant_settings.collection_name}
             )
 
-        find_tool.__name__ = "qdrant_find"
-        self.tool(name="qdrant_find", description=self.tool_settings.tool_find_description)(find_tool)
+        self._register_legacy_tool("qdrant_find", find_tool, self.tool_settings.tool_find_description)
 
         if not self.qdrant_settings.read_only:
             store_tool = qdrant_store
@@ -206,8 +239,7 @@ class QdrantMCPServer(FastMCP):
                     store_tool, {"collection_name": self.qdrant_settings.collection_name}
                 )
 
-            store_tool.__name__ = "qdrant_store"
-            self.tool(name="qdrant_store", description=self.tool_settings.tool_store_description)(store_tool)
+            self._register_legacy_tool("qdrant_store", store_tool, self.tool_settings.tool_store_description)
 
         # Add enhanced tools if enabled
         if self.qdrant_settings.enable_collection_management:
@@ -224,7 +256,7 @@ class QdrantMCPServer(FastMCP):
     def setup_collection_management_tools(self):
         """Setup enhanced collection management tools."""
 
-        @self.tool(description=self.tool_settings.tool_list_collections_description)
+        @self._profile_tool(description=self.tool_settings.tool_list_collections_description)
         async def list_collections(ctx: Context) -> list[str]:
             """List all available Qdrant collections."""
             try:
@@ -236,7 +268,7 @@ class QdrantMCPServer(FastMCP):
                 await ctx.debug(f"Error listing collections: {e}")
                 return [f"Error listing collections: {str(e)}"]
 
-        @self.tool(description=self.tool_settings.tool_get_collection_info_description)
+        @self._profile_tool(description=self.tool_settings.tool_get_collection_info_description)
         async def get_collection_info(
             ctx: Context,
             collection_name: Annotated[str, Field(description="Name of the collection to get info about")]
@@ -265,7 +297,7 @@ class QdrantMCPServer(FastMCP):
                 return [f"Error getting collection info: {str(e)}"]
 
         if not self.qdrant_settings.read_only:
-            @self.tool(description=self.tool_settings.tool_create_collection_description)
+            @self._profile_tool(description=self.tool_settings.tool_create_collection_description)
             async def create_collection(
                 ctx: Context,
                 collection_name: Annotated[str, Field(description="Name of the collection to create")],
@@ -304,7 +336,7 @@ class QdrantMCPServer(FastMCP):
                     await ctx.debug(f"Error creating collection: {e}")
                     return f"Error creating collection: {str(e)}"
 
-            @self.tool(description=self.tool_settings.tool_create_hybrid_collection_description)
+            @self._profile_tool(description=self.tool_settings.tool_create_hybrid_collection_description)
             async def create_hybrid_collection(
                 ctx: Context,
                 collection_name: Annotated[str, Field(description="Name of the hybrid collection to create")],
@@ -341,7 +373,7 @@ class QdrantMCPServer(FastMCP):
                     await ctx.debug(f"Error creating hybrid collection: {e}")
                     return f"Error: {str(e)}"
 
-            @self.tool(description=self.tool_settings.tool_delete_collection_description)
+            @self._profile_tool(description=self.tool_settings.tool_delete_collection_description)
             async def delete_collection(
                 ctx: Context,
                 collection_name: Annotated[str, Field(description="Name of the collection to delete")],
@@ -364,7 +396,7 @@ class QdrantMCPServer(FastMCP):
     def setup_embedding_model_tools(self):
         """Setup enhanced embedding model tools."""
 
-        @self.tool(description=self.tool_settings.tool_set_collection_embedding_model_impl_description)
+        @self._profile_tool(description=self.tool_settings.tool_set_collection_embedding_model_impl_description)
         async def set_collection_embedding_model(
             ctx: Context,
             model_name: Annotated[str, Field(description="Embedding model name, e.g. 'Qwen/Qwen3-Embedding-8B'")],
@@ -390,7 +422,7 @@ class QdrantMCPServer(FastMCP):
                 await ctx.debug(f"Error setting embedding model: {e}")
                 return f"Error setting embedding model: {str(e)}"
 
-        @self.tool(description=self.tool_settings.tool_list_embedding_models_description)
+        @self._profile_tool(description=self.tool_settings.tool_list_embedding_models_description)
         async def list_embedding_models(ctx: Context) -> list[str]:
             """List all available embedding models."""
             try:
@@ -422,7 +454,7 @@ class QdrantMCPServer(FastMCP):
     def setup_advanced_search_tools(self):
         """Setup advanced search and storage tools with enhanced embedding support."""
 
-        @self.tool(description=self.tool_settings.tool_search_documents_description)
+        @self._profile_tool(description=self.tool_settings.tool_search_documents_description)
         async def search_documents(
             ctx: Context,
             query: Annotated[str, Field(description="Semantic search query")],
@@ -484,7 +516,7 @@ class QdrantMCPServer(FastMCP):
                 await ctx.debug(f"Error in search_documents: {e}")
                 return [f"Error: {str(e)}"]
 
-        @self.tool(description=self.tool_settings.tool_bootstrap_indexes_description)
+        @self._profile_tool(description=self.tool_settings.tool_bootstrap_indexes_description)
         async def bootstrap_collection_indexes(
             ctx: Context,
             collection_name: Annotated[str, Field(description="Collection to index")],
@@ -497,7 +529,7 @@ class QdrantMCPServer(FastMCP):
                 await ctx.debug(f"Error bootstrapping indexes: {e}")
                 return f"Error: {str(e)}"
 
-        @self.tool(description=self.tool_settings.tool_hybrid_search_description)
+        @self._profile_tool(description=self.tool_settings.tool_hybrid_search_description)
         async def hybrid_search(
             ctx: Context,
             query: Annotated[str, Field(description="Search query")],
@@ -530,7 +562,7 @@ class QdrantMCPServer(FastMCP):
                 await ctx.debug(f"Error in hybrid search: {e}")
                 return [f"Error in hybrid search: {str(e)}"]
 
-        @self.tool(description=self.tool_settings.tool_scroll_description)
+        @self._profile_tool(description=self.tool_settings.tool_scroll_description)
         async def scroll_collection(
             ctx: Context,
             collection_name: Annotated[str, Field(description="Collection to browse")],
@@ -563,7 +595,7 @@ class QdrantMCPServer(FastMCP):
                 return [f"Error scrolling collection: {str(e)}"]
 
         if not self.qdrant_settings.read_only:
-            @self.tool(description=self.tool_settings.tool_batch_store_description)
+            @self._profile_tool(description=self.tool_settings.tool_batch_store_description)
             async def qdrant_store_batch(
                 ctx: Context,
                 entries: Annotated[list[dict], Field(description="List of entries to store, each with 'content' and optional 'metadata' and 'id'")],
@@ -612,7 +644,7 @@ class QdrantMCPServer(FastMCP):
         """Setup file ingestion tools with macOS metadata extraction."""
         from datetime import datetime, timezone
 
-        @self.tool(description=self.tool_settings.tool_ingest_file_description)
+        @self._profile_tool(description=self.tool_settings.tool_ingest_file_description)
         async def ingest_file(
             ctx: Context,
             file_path: Annotated[str, Field(description="Absolute path to the file to ingest")],
@@ -685,7 +717,7 @@ class QdrantMCPServer(FastMCP):
                 await ctx.debug(f"Error ingesting file: {e}")
                 return f"Error ingesting '{file_path}': {str(e)}"
 
-        @self.tool(description=self.tool_settings.tool_ingest_folder_description)
+        @self._profile_tool(description=self.tool_settings.tool_ingest_folder_description)
         async def ingest_folder(
             ctx: Context,
             folder_path: Annotated[str, Field(description="Absolute path to the folder to ingest")],

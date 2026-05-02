@@ -202,6 +202,13 @@ class QdrantSettings(BaseSettings):
         default=True, validation_alias="QDRANT_ENABLE_RESOURCES"
     )
 
+    # MCP tool exposure profile (minimal | canonical | full).
+    # Default: canonical. See mcp_runtime/profiles.py for the per-tool mapping.
+    mcp_tool_profile: str = Field(
+        default="canonical",
+        validation_alias="QDRANT_MCP_TOOL_PROFILE",
+    )
+
     def filterable_fields_dict(self) -> dict[str, FilterableField]:
         if self.filterable_fields is None:
             return {}
