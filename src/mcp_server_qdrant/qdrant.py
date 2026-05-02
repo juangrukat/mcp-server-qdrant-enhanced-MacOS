@@ -194,18 +194,21 @@ class QdrantConnector:
             for point in points
         ]
 
-    async def _ensure_collection_exists(self, collection_name: str):
+    async def _ensure_collection_exists(
+        self, collection_name: str, embedding_provider: EmbeddingProvider | None = None
+    ):
         """
         Ensure that the collection exists, creating it if necessary.
-        Uses the CURRENT embedding provider to ensure vector name consistency.
+        Uses the explicitly-passed embedding provider (preferred for multi-agent
+        safety) or falls back to the connector's default provider.
         :param collection_name: The name of the collection to ensure exists.
+        :param embedding_provider: Optional override for this request only.
         """
+        provider = embedding_provider or self._embedding_provider
         collection_exists = await self._client.collection_exists(collection_name)
         if not collection_exists:
-            # CRITICAL: Use the CURRENT embedding provider (which may have been swapped)
-            # This ensures the collection is created with the same vector name that will be used for storage
-            vector_size = self._embedding_provider.get_vector_size()
-            vector_name = self._embedding_provider.get_vector_name()
+            vector_size = provider.get_vector_size()
+            vector_name = provider.get_vector_name()
 
             logger.info(f"Creating collection '{collection_name}' with vector name '{vector_name}' and size {vector_size}")
 
@@ -360,31 +363,28 @@ class QdrantConnector:
             logger.error(f"Error deleting collection {collection_name}: {e}")
             return False
 
-    async def batch_store(self, entries: list[BatchEntry], collection_name: str | None = None) -> int:
+    async def batch_store(
+        self,
+        entries: list[BatchEntry],
+        collection_name: str | None = None,
+        embedding_provider: EmbeddingProvider | None = None,
+    ) -> int:
         """
-        Store multiple entries in batch with improved vector name handling.
-        :param entries: List of entries to store.
-        :param collection_name: Name of the collection to store in.
-        :return: Number of entries successfully stored.
+        Store multiple entries in batch using the per-request embedding provider
+        when supplied, falling back to the connector's default. Multi-client
+        safe: no shared mutable provider state.
         """
         collection_name = collection_name or self._default_collection_name
         assert collection_name is not None
+        provider = embedding_provider or self._embedding_provider
 
-        # Ensure collection exists with the CURRENT embedding provider
-        await self._ensure_collection_exists(collection_name)
+        await self._ensure_collection_exists(collection_name, embedding_provider=provider)
 
         try:
             points = []
-            documents = []
-            
-            # Collect all documents for batch embedding
-            for entry in entries:
-                documents.append(entry.content)
-            
-            # Embed all documents at once
-            embeddings = await self._embedding_provider.embed_documents(documents)
-            
-            # Create points with actual embeddings
+            documents = [entry.content for entry in entries]
+            embeddings = await provider.embed_documents(documents)
+
             for i, entry in enumerate(entries):
                 if entry.id:
                     try:
@@ -398,7 +398,7 @@ class QdrantConnector:
                     models.PointStruct(
                         id=point_id,
                         payload={"document": entry.content, METADATA_PATH: entry.metadata or {}},
-                        vector={self._embedding_provider.get_vector_name(): embeddings[i]},
+                        vector={provider.get_vector_name(): embeddings[i]},
                     )
                 )
 
@@ -474,7 +474,8 @@ class QdrantConnector:
         limit: int = 10,
         query_filter: models.Filter | None = None,
         min_score: float | None = None,
-        search_params: dict | None = None
+        search_params: dict | None = None,
+        embedding_provider: EmbeddingProvider | None = None,
     ) -> list[tuple[Entry, float]]:
         """
         Modern hybrid search using Query API with intelligent fallback to avoid vector name mismatches.
@@ -494,8 +495,8 @@ class QdrantConnector:
         if not collection_exists:
             return []
 
-        # Always use client-side embedding for now to ensure consistency in tests
-        return await self._hybrid_search_client_side(query, collection_name, limit, query_filter, min_score)
+        provider = embedding_provider or self._embedding_provider
+        return await self._hybrid_search_client_side(query, collection_name, limit, query_filter, min_score, provider)
 
     async def _hybrid_search_server_side(
         self,
@@ -526,14 +527,16 @@ class QdrantConnector:
         limit: int,
         query_filter: models.Filter | None,
         min_score: float | None,
+        embedding_provider: EmbeddingProvider | None = None,
     ) -> list[tuple[Entry, float]]:
         """Client-side hybrid search using Query API."""
 
-        query_vector = await self._embedding_provider.embed_query(query)
+        provider = embedding_provider or self._embedding_provider
+        query_vector = await provider.embed_query(query)
 
         search_results_raw = await self._client.query_points(
             collection_name=collection_name,
-            query=(self._embedding_provider.get_vector_name(), query_vector),
+            query=(provider.get_vector_name(), query_vector),
             limit=limit,
             query_filter=query_filter,
             with_payload=True,
@@ -607,14 +610,16 @@ class QdrantConnector:
         entries: list[BatchEntry],
         collection_name: str,
         sparse_provider,
+        embedding_provider: EmbeddingProvider | None = None,
     ) -> int:
         """Store entries with both dense and sparse vectors."""
         try:
+            dense_provider = embedding_provider or self._embedding_provider
             documents = [e.content for e in entries]
-            dense = await self._embedding_provider.embed_documents(documents)
+            dense = await dense_provider.embed_documents(documents)
             sparse = await sparse_provider.embed_documents(documents)
 
-            dense_name = self._embedding_provider.get_vector_name()
+            dense_name = dense_provider.get_vector_name()
             sparse_name = sparse_provider.get_vector_name()
 
             points = []
@@ -654,16 +659,18 @@ class QdrantConnector:
         limit: int = 10,
         query_filter: models.Filter | None = None,
         prefetch_limit: int = 50,
+        embedding_provider: EmbeddingProvider | None = None,
     ) -> list[tuple[Entry, float]]:
         """
         Hybrid search using Qdrant's Query API with prefetch + Reciprocal Rank Fusion.
         Runs dense and sparse retrieval in parallel server-side, then fuses ranks.
         """
         try:
-            dense_vector = await self._embedding_provider.embed_query(query)
+            dense_provider = embedding_provider or self._embedding_provider
+            dense_vector = await dense_provider.embed_query(query)
             sparse_vector = await sparse_provider.embed_query(query)
 
-            dense_name = self._embedding_provider.get_vector_name()
+            dense_name = dense_provider.get_vector_name()
             sparse_name = sparse_provider.get_vector_name()
 
             response = await self._client.query_points(

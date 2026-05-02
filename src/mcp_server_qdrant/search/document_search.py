@@ -33,6 +33,7 @@ async def search_documents_grouped(
     min_score: float | None = None,
     sparse_provider: Any = None,
     reranker: Reranker | None = None,
+    embedding_provider: Any = None,
 ) -> list[dict[str, Any]]:
     """
     Search and return distinct documents, ordered by best-chunk score.
@@ -57,6 +58,7 @@ async def search_documents_grouped(
             sparse_provider=sparse_provider,
             limit=overfetch,
             query_filter=query_filter,
+            embedding_provider=embedding_provider,
         )
     else:
         raw = await connector.hybrid_search(
@@ -65,6 +67,7 @@ async def search_documents_grouped(
             limit=overfetch,
             query_filter=query_filter,
             min_score=min_score,
+            embedding_provider=embedding_provider,
         )
 
     # Optional reranking pass over the chunk pool before grouping

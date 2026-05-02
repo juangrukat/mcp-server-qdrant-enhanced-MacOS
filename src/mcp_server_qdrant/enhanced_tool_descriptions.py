@@ -77,11 +77,14 @@ DEFAULT_TOOL_SCROLL_DESCRIPTION = (
 )
 
 DEFAULT_TOOL_SET_COLLECTION_EMBEDDING_MODEL_IMPL_DESCRIPTION = (
-    "Switch the active embedding model for subsequent operations. "
-    "Usage: set_collection_embedding_model(model_name='Qwen/Qwen3-Embedding-8B'). "
-    "WARNING: Switching models on an existing collection will cause dimension mismatches — "
-    "only use this before creating a new collection or with a fresh collection. "
-    "Use list_embedding_models to see available models and their dimensions."
+    "Assign an embedding model to a specific collection. "
+    "Usage: set_collection_embedding_model(collection_name='my_docs', "
+    "model_name='Qwen/Qwen3-Embedding-8B'). "
+    "Per-request safe: this does NOT mutate any process-global state, so multiple agents "
+    "sharing one server can target different collections with different models without "
+    "interfering with each other. The model still has to match the collection's existing "
+    "vector dimensions, so for an empty/new collection prefer create_collection with the "
+    "embedding_model argument instead. Use list_embedding_models to discover options."
 )
 
 DEFAULT_TOOL_INGEST_FILE_DESCRIPTION = (

@@ -14,7 +14,9 @@ from mcp_server_qdrant.common.filters import make_indexes
 from mcp_server_qdrant.common.func_tools import make_partial_function
 from mcp_server_qdrant.common.wrap_filters import wrap_filters
 from mcp_server_qdrant.embedding_manager import EnhancedEmbeddingModelManager
+from mcp_server_qdrant.embeddings.base import EmbeddingProvider
 from mcp_server_qdrant.mcp_runtime.profiles import ToolProfile, is_tool_visible
+from mcp_server_qdrant.mcp_runtime.provider_resolver import ProviderResolver
 from mcp_server_qdrant.qdrant import ArbitraryFilter, Entry, QdrantConnector, BatchEntry
 from mcp_server_qdrant.settings import (
     EmbeddingProviderSettings,
@@ -48,10 +50,19 @@ class QdrantMCPServer(FastMCP):
             # Initialize enhanced embedding model manager
             self.embedding_manager = EnhancedEmbeddingModelManager(embedding_provider_settings)
 
-            # Use the default provider from the simplified embedding manager
+            # The server's startup-time default provider. Treat as immutable for
+            # the process lifetime — multi-client safety relies on this.
             self.embedding_provider = self.embedding_manager.get_default_provider()
 
-            # Sparse provider is lazily initialized on first hybrid operation
+            # Per-request provider resolver: avoids global mutable state when
+            # multiple agents share one HTTP MCP server.
+            self.provider_resolver = ProviderResolver(
+                self.embedding_manager, self.embedding_provider
+            )
+
+            # Sparse provider is lazily initialized on first hybrid operation.
+            # NOTE: this is still a lazy singleton; sparse providers are stateless
+            # for fastembed BM25 so sharing across requests is safe.
             self._sparse_provider = None
 
             # Active MCP tool profile (minimal | canonical | full)
@@ -430,28 +441,39 @@ class QdrantMCPServer(FastMCP):
         @self._profile_tool(description=self.tool_settings.tool_set_collection_embedding_model_impl_description)
         async def set_collection_embedding_model(
             ctx: Context,
+            collection_name: Annotated[str, Field(description="Collection to assign the embedding model to")],
             model_name: Annotated[str, Field(description="Embedding model name, e.g. 'Qwen/Qwen3-Embedding-8B'")],
-        ) -> str:
-            """Switch the active embedding model. Affects all subsequent store/search operations."""
-            try:
+        ) -> dict:
+            """Assign an embedding model to a collection (does NOT mutate other clients' state)."""
+            from mcp_server_qdrant.mcp_runtime.envelope import envelope_context, success_from, failure_from
+            profile = self.active_profile.name.lower()
+            with envelope_context(profile) as acc:
                 model_info = self.embedding_manager.get_model_info(model_name)
                 if not model_info:
                     available = [m.model_name for m in self.embedding_manager.list_available_models()]
-                    return (
-                        f"Unknown model '{model_name}'. "
-                        f"Available models include: {', '.join(available[:10])}..."
+                    return failure_from(
+                        acc,
+                        code="unknown_embedding_model",
+                        message=f"Unknown model '{model_name}'. Some available: {', '.join(available[:8])}...",
+                        profile=profile,
                     )
-                provider = self.embedding_manager.create_provider_for_model(model_name)
-                self.qdrant_connector.set_embedding_provider(provider)
-                self.embedding_provider = provider
-                return (
-                    f"Active embedding model set to '{model_name}' "
-                    f"({model_info.vector_size}D). "
-                    f"Create a new collection with vector_size={model_info.vector_size} to use it."
+                # Per-request resolution: record the assignment without swapping
+                # any process-global mutable state. Subsequent calls that touch
+                # this collection will pick up the assignment via the resolver.
+                self.provider_resolver.assign_collection_model(collection_name, model_name)
+                acc.warnings.append(
+                    "Note: this assigns a model to a collection. It does not mutate global "
+                    "server state. Other clients targeting different collections are unaffected."
                 )
-            except Exception as e:
-                await ctx.debug(f"Error setting embedding model: {e}")
-                return f"Error setting embedding model: {str(e)}"
+                return success_from(
+                    acc,
+                    data={
+                        "collection": collection_name,
+                        "embedding_model": model_name,
+                        "vector_size": model_info.vector_size,
+                    },
+                    profile=profile,
+                )
 
         @self._profile_tool(description=self.tool_settings.tool_list_embedding_models_description)
         async def list_embedding_models(ctx: Context) -> list[str]:
@@ -495,6 +517,7 @@ class QdrantMCPServer(FastMCP):
             filter: Annotated[dict | None, Field(description="High-level filter: {must, should, must_not}")] = None,
             mode: Annotated[str, Field(description="'dense' | 'hybrid' | 'rerank' | 'late_interaction' (reserved)")] = "dense",
             reranker_model: Annotated[str | None, Field(description="Reranker for mode='rerank' (default Xenova/ms-marco-MiniLM-L-6-v2)")] = None,
+            embedding_model: Annotated[str | None, Field(description="Override the embedding model for this request only (multi-agent safe)")] = None,
         ) -> dict:
             """Document-level grouped search — best chunk per file, ranked by document score."""
             from mcp_server_qdrant.mcp_runtime.envelope import envelope_context, success_from, failure_from
@@ -519,6 +542,13 @@ class QdrantMCPServer(FastMCP):
                     use_sparse = rmode in (RetrievalMode.HYBRID, RetrievalMode.RERANK)
                     sparse_provider = self.get_sparse_provider() if use_sparse else None
 
+                    # Per-request provider resolution: explicit > collection > default.
+                    request_provider = await self.provider_resolver.resolve(
+                        embedding_model=embedding_model,
+                        collection_name=collection_name,
+                    )
+                    acc.stats["resolved_embedding_model"] = request_provider.get_model_name()
+
                     reranker = None
                     if rmode == RetrievalMode.RERANK:
                         reranker_name = reranker_model or "Xenova/ms-marco-MiniLM-L-6-v2"
@@ -534,6 +564,7 @@ class QdrantMCPServer(FastMCP):
                         query_filter=qfilter,
                         sparse_provider=sparse_provider,
                         reranker=reranker,
+                        embedding_provider=request_provider,
                     )
                     acc.stats["raw_chunks_fetched"] = sum(len(d["chunks"]) for d in docs)
                     acc.stats["documents_returned"] = len(docs)
@@ -715,6 +746,7 @@ class QdrantMCPServer(FastMCP):
             collection_name: Annotated[str, Field(description="Collection to store chunks in")],
             extra_metadata: Annotated[str | None, Field(description="Optional extra metadata as JSON string")] = None,
             mode: Annotated[str, Field(description="'dense' (default) or 'hybrid' (collection must be hybrid)")] = "dense",
+            embedding_model: Annotated[str | None, Field(description="Override the embedding model for this request only")] = None,
         ) -> dict:
             """Ingest a single file: extract text, collect macOS metadata, chunk and store."""
             from mcp_server_qdrant.mcp_runtime.envelope import envelope_context, success_from, failure_from
@@ -767,16 +799,25 @@ class QdrantMCPServer(FastMCP):
 
                     await self.qdrant_connector.ensure_macos_metadata_indexes(collection_name)
 
+                    request_provider = await self.provider_resolver.resolve(
+                        embedding_model=embedding_model,
+                        collection_name=collection_name,
+                    )
+                    acc.stats["resolved_embedding_model"] = request_provider.get_model_name()
+
                     batch_entries = [
                         BatchEntry(content=chunk.text, metadata=chunk.metadata)
                         for chunk in chunks
                     ]
                     if mode == "hybrid":
                         stored = await self.qdrant_connector.batch_store_hybrid(
-                            batch_entries, collection_name, self.get_sparse_provider()
+                            batch_entries, collection_name, self.get_sparse_provider(),
+                            embedding_provider=request_provider,
                         )
                     else:
-                        stored = await self.qdrant_connector.batch_store(batch_entries, collection_name)
+                        stored = await self.qdrant_connector.batch_store(
+                            batch_entries, collection_name, embedding_provider=request_provider
+                        )
 
                     acc.stats.update({
                         "extractor_used": doc.extractor_used,
@@ -812,6 +853,7 @@ class QdrantMCPServer(FastMCP):
             skip_hidden: Annotated[bool, Field(description="Skip hidden files and directories (starting with .)")] = True,
             extra_metadata: Annotated[str | None, Field(description="Optional extra metadata as JSON string applied to all files")] = None,
             mode: Annotated[str, Field(description="'dense' (default) or 'hybrid' (collection must be hybrid)")] = "dense",
+            embedding_model: Annotated[str | None, Field(description="Override the embedding model for this request only")] = None,
         ) -> dict:
             """Recursively ingest all supported files in a folder."""
             from mcp_server_qdrant.mcp_runtime.envelope import envelope_context, success_from, failure_from
@@ -859,6 +901,12 @@ class QdrantMCPServer(FastMCP):
 
                 await self.qdrant_connector.ensure_macos_metadata_indexes(collection_name)
 
+                request_provider = await self.provider_resolver.resolve(
+                    embedding_model=embedding_model,
+                    collection_name=collection_name,
+                )
+                acc.stats["resolved_embedding_model"] = request_provider.get_model_name()
+
                 total_chunks = 0
                 total_files = 0
                 errors: list[dict] = []
@@ -889,10 +937,13 @@ class QdrantMCPServer(FastMCP):
                         ]
                         if mode == "hybrid":
                             stored = await self.qdrant_connector.batch_store_hybrid(
-                                batch_entries, collection_name, self.get_sparse_provider()
+                                batch_entries, collection_name, self.get_sparse_provider(),
+                                embedding_provider=request_provider,
                             )
                         else:
-                            stored = await self.qdrant_connector.batch_store(batch_entries, collection_name)
+                            stored = await self.qdrant_connector.batch_store(
+                                batch_entries, collection_name, embedding_provider=request_provider
+                            )
                         total_chunks += stored
                         total_files += 1
                     except Exception as e:
