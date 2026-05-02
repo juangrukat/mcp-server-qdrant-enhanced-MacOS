@@ -14,6 +14,8 @@ dependencies = [
     "pdfminer.six>=20221105",
     "pypdf>=4.0.0",
     "python-docx>=1.1.0",
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.30.0",
 ]
 
 [build-system]
@@ -34,6 +36,7 @@ dev-dependencies = [
 
 [project.scripts]
 mcp-server-qdrant = "mcp_server_qdrant.main:main"
+mcp-server-qdrant-webui = "mcp_server_qdrant.webui.main:main"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
