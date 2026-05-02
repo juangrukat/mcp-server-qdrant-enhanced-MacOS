@@ -256,28 +256,27 @@ class QdrantMCPServer(FastMCP):
             async def create_collection(
                 ctx: Context,
                 collection_name: Annotated[str, Field(description="Name of the collection to create")],
-                vector_size: Annotated[int, Field(description="Size of the vectors (e.g., 384, 768, 1024)")],
+                embedding_model: Annotated[str, Field(description="Embedding model, e.g. 'Qwen/Qwen3-Embedding-8B' or 'sentence-transformers/all-MiniLM-L6-v2'")],
+                vector_size: Annotated[int, Field(description="Vector size override — 0 means infer from model")] = 0,
                 distance: Annotated[str, Field(description="Distance metric: cosine, dot, euclidean, manhattan")] = "cosine",
-                embedding_model: Annotated[str, Field(description="Embedding model to use for this collection")] = ""
             ) -> str:
                 """Create a new collection with specified parameters."""
                 try:
-                    # If no embedding model specified, try to find one matching the vector size
-                    if not embedding_model:
-                        found_model = self.embedding_manager.find_model_by_vector_size(vector_size)
-                        if not found_model:
-                            return f"No embedding model found for vector size {vector_size}. Please specify a model."
-                        embedding_model = found_model
-
                     # Validate and get model info
                     model_info = self.embedding_manager.get_model_info(embedding_model)
                     if not model_info:
-                        return f"Unknown embedding model: {embedding_model}"
+                        return f"Unknown embedding model: '{embedding_model}'. Use list_embedding_models to see options."
 
-                    # Ensure vector size matches model
-                    if model_info.vector_size != vector_size:
-                        await ctx.debug(f"Adjusting vector size from {vector_size} to {model_info.vector_size} to match model")
-                        vector_size = model_info.vector_size
+                    # Infer vector size from model unless explicitly overridden
+                    resolved_size = vector_size or model_info.vector_size
+                    if vector_size and vector_size != model_info.vector_size:
+                        if vector_size > model_info.vector_size:
+                            return (
+                                f"Requested vector_size {vector_size} exceeds model max "
+                                f"{model_info.vector_size} for '{embedding_model}'."
+                            )
+                        await ctx.debug(f"Using custom vector_size {vector_size} (model supports up to {model_info.vector_size})")
+                    vector_size = resolved_size
 
                     success = await self.qdrant_connector.create_collection_with_config(
                         collection_name, vector_size, distance
@@ -314,6 +313,32 @@ class QdrantMCPServer(FastMCP):
 
     def setup_embedding_model_tools(self):
         """Setup enhanced embedding model tools."""
+
+        @self.tool(description=self.tool_settings.tool_set_collection_embedding_model_impl_description)
+        async def set_collection_embedding_model(
+            ctx: Context,
+            model_name: Annotated[str, Field(description="Embedding model name, e.g. 'Qwen/Qwen3-Embedding-8B'")],
+        ) -> str:
+            """Switch the active embedding model. Affects all subsequent store/search operations."""
+            try:
+                model_info = self.embedding_manager.get_model_info(model_name)
+                if not model_info:
+                    available = [m.model_name for m in self.embedding_manager.list_available_models()]
+                    return (
+                        f"Unknown model '{model_name}'. "
+                        f"Available models include: {', '.join(available[:10])}..."
+                    )
+                provider = self.embedding_manager.create_provider_for_model(model_name)
+                self.qdrant_connector.set_embedding_provider(provider)
+                self.embedding_provider = provider
+                return (
+                    f"Active embedding model set to '{model_name}' "
+                    f"({model_info.vector_size}D). "
+                    f"Create a new collection with vector_size={model_info.vector_size} to use it."
+                )
+            except Exception as e:
+                await ctx.debug(f"Error setting embedding model: {e}")
+                return f"Error setting embedding model: {str(e)}"
 
         @self.tool(description=self.tool_settings.tool_list_embedding_models_description)
         async def list_embedding_models(ctx: Context) -> list[str]:

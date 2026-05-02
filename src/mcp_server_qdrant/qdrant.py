@@ -70,6 +70,10 @@ class QdrantConnector:
         )
         self._field_indexes = field_indexes
 
+    def set_embedding_provider(self, provider: EmbeddingProvider) -> None:
+        """Swap the active embedding provider (affects all subsequent operations)."""
+        self._embedding_provider = provider
+
     async def get_collection_names(self) -> list[str]:
         """
         Get the names of all collections in the Qdrant server.

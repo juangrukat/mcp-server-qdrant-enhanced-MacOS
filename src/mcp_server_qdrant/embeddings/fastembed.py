@@ -5,6 +5,12 @@ from fastembed.common.model_description import DenseModelDescription
 
 from mcp_server_qdrant.embeddings.base import EmbeddingProvider
 
+# Fallback dimensions for models that may not appear in fastembed's registry
+KNOWN_MODEL_DIMS: dict[str, int] = {
+    "Qwen/Qwen3-Embedding-8B": 4096,
+    "Qwen/Qwen3-Embedding-0.6B": 1024,
+}
+
 
 class FastEmbedProvider(EmbeddingProvider):
     """
@@ -44,12 +50,17 @@ class FastEmbedProvider(EmbeddingProvider):
 
     def get_vector_size(self) -> int:
         """Get the size of the vector for the Qdrant collection."""
-        model_description: DenseModelDescription = (
-            self.embedding_model._get_model_description(self.model_name)
-        )
-        if model_description.dim is None:
-            raise ValueError("Model dimension (dim) is None for model: {}".format(self.model_name))
-        return model_description.dim
+        try:
+            model_description: DenseModelDescription = (
+                self.embedding_model._get_model_description(self.model_name)
+            )
+            if model_description.dim is not None:
+                return model_description.dim
+        except Exception:
+            pass
+        if self.model_name in KNOWN_MODEL_DIMS:
+            return KNOWN_MODEL_DIMS[self.model_name]
+        raise ValueError(f"Cannot determine vector size for model: {self.model_name}")
 
     def get_model_name(self) -> str:
         """Get the name of the embedding model."""

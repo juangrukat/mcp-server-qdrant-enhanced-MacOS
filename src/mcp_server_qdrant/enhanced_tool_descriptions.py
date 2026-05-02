@@ -75,3 +75,11 @@ DEFAULT_TOOL_SCROLL_DESCRIPTION = (
     "Usage: scroll_collection(collection_name='my_collection', limit=20, offset='point_id'). "
     "Returns entries and next offset for pagination."
 )
+
+DEFAULT_TOOL_SET_COLLECTION_EMBEDDING_MODEL_IMPL_DESCRIPTION = (
+    "Switch the active embedding model for subsequent operations. "
+    "Usage: set_collection_embedding_model(model_name='Qwen/Qwen3-Embedding-8B'). "
+    "WARNING: Switching models on an existing collection will cause dimension mismatches — "
+    "only use this before creating a new collection or with a fresh collection. "
+    "Use list_embedding_models to see available models and their dimensions."
+)

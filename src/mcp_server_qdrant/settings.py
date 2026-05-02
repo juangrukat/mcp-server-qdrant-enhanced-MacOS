@@ -22,6 +22,7 @@ from mcp_server_qdrant.enhanced_tool_descriptions import (
     DEFAULT_TOOL_HYBRID_SEARCH_DESCRIPTION,
     DEFAULT_TOOL_SET_COLLECTION_EMBEDDING_MODEL_DESCRIPTION,
     DEFAULT_TOOL_LIST_EMBEDDING_MODELS_DESCRIPTION,
+    DEFAULT_TOOL_SET_COLLECTION_EMBEDDING_MODEL_IMPL_DESCRIPTION,
 )
 
 METADATA_PATH = "metadata"
@@ -75,6 +76,10 @@ class ToolSettings(BaseSettings):
     tool_list_embedding_models_description: str = Field(
         default=DEFAULT_TOOL_LIST_EMBEDDING_MODELS_DESCRIPTION,
         validation_alias="TOOL_LIST_EMBEDDING_MODELS_DESCRIPTION",
+    )
+    tool_set_collection_embedding_model_impl_description: str = Field(
+        default=DEFAULT_TOOL_SET_COLLECTION_EMBEDDING_MODEL_IMPL_DESCRIPTION,
+        validation_alias="TOOL_SET_COLLECTION_EMBEDDING_MODEL_IMPL_DESCRIPTION",
     )
 
 
