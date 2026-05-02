@@ -1,224 +1,108 @@
-# mcp-server-qdrant-enhanced-MacOS: A Qdrant MCP Server with macOS-native ingestion
+# mcp-server-qdrant-enhanced
 
-![alt text](image.png)
+An enhanced Model Context Protocol server for storing, ingesting, and searching
+semantic context in Qdrant.
 
-## Overview
+This project extends the base Qdrant MCP idea with macOS-aware file ingestion,
+document-grouped retrieval, dynamic FastEmbed model selection, hybrid dense +
+sparse search support, MCP tool exposure profiles, and a FastAPI surface for
+non-MCP clients.
 
-A Model Context Protocol server for storing and retrieving semantic memories using the Qdrant vector search engine.
-This fork adds **macOS-native file ingestion** (Spotlight metadata + Finder tags), **Qwen3 large-dimension embeddings**, **document-level grouped search**, and a **REST API for web UI integration**.
+## Current project state
 
-## ✨ Key Features
+This repository is in active development.
 
-- 📂 **macOS file ingestion** — `ingest_file` and `ingest_folder` tools that extract text from .txt/.md/.pdf/.docx and capture macOS Spotlight metadata (Finder tags, comments, dates, content type, authors)
-- 🧠 **Qwen3-Embedding-8B** — 4096-dimension embeddings supported alongside the standard FastEmbed model lineup
-- 🔎 **Document-level grouped search** — `search_documents` reranks chunk hits at the file level so single PDFs don't dominate results
-- 🎛️ **Filter grammar** — express filters as `must`/`should`/`must_not` instead of raw Qdrant JSON
-- 🌐 **REST API** — built-in FastAPI server (`mcp-server-qdrant-webui`) wraps every operation for easy web UI integration
-- 🤖 **Automatic Model Selection** — No manual embedding model configuration needed
-- 🔄 **Per-Collection Model Memory** — Each collection remembers its embedding model
-- 🐳 **Multiple Deployment Modes** — Memory, local file, auto-managed Docker, or external
-- 📊 **Advanced Search** — Hybrid search with similarity scores and filtering
-- 🛠️ **Collection Management** — Create, configure, and manage collections
-- 🎯 **Distance Metric Support** — Cosine, dot product, Euclidean, and Manhattan
-- 📈 **Batch Operations** — Efficient bulk storage and retrieval
+Important status for the current checkout:
 
-## Components
+- The package is a Python project named `mcp-server-qdrant` in
+  `pyproject.toml`.
+- The main MCP entry point is `mcp-server-qdrant`.
+- The REST API entry point is `mcp-server-qdrant-webui`.
+- The default MCP tool profile is `canonical`.
+- The worktree currently contains a pending discovery-tools integration:
+  `src/mcp_server_qdrant/mcp_runtime/discovery.py` exists and
+  `mcp_server.py` calls `self.setup_discovery_tools()`, but that method is not
+  defined in the current file. As of this checkout, importing the MCP server
+  fails until that integration is completed or the call is removed.
+- This README documents the implemented code paths and flags the known startup
+  issue rather than hiding it.
 
-### Tools (13 Total)
+## What it does
 
-#### Core Storage & Search
-1. **`qdrant-store`** - Store information in Qdrant database
-   - `information` (string): Information to store
-   - `metadata` (JSON): Optional metadata
-   - `collection_name` (string): Target collection (if no default set)
+At a high level, the server lets an MCP client or HTTP client:
 
-2. **`qdrant-find`** - Retrieve relevant information from database
-   - `query` (string): Search query
-   - `collection_name` (string): Collection to search (if no default set)
+- Create and inspect Qdrant collections.
+- Store individual text entries or batches.
+- Ingest `.txt`, `.md`, `.pdf`, and `.docx` files.
+- Capture macOS Spotlight and Finder metadata while ingesting files.
+- Search by semantic similarity.
+- Search by distinct document instead of raw chunks.
+- Filter searches using a compact high-level filter grammar.
+- Use FastEmbed dense embedding models, including supplemental Qwen3 entries.
+- Create hybrid collections with dense vectors plus Qdrant BM25 sparse vectors.
+- Run over MCP stdio, MCP SSE, MCP streamable HTTP, or the included FastAPI app.
 
-#### Collection Management
-3. **`list_collections`** - List all available Qdrant collections
-4. **`get_collection_info`** - Get detailed collection statistics and configuration
-   - `collection_name` (string): Collection to inspect
-5. **`create_collection`** - Create new collection with custom settings
-   - `collection_name` (string): Name for new collection
-   - `vector_size` (int): Vector dimensions (e.g., 384, 768, 1024)
-   - `distance` (string): Distance metric (cosine, dot, euclidean, manhattan)
-   - `embedding_model` (string): Optional embedding model to use
-6. **`delete_collection`** - Delete collection permanently
-   - `collection_name` (string): Collection to delete
-   - `confirm` (bool): Required confirmation flag
+## Installation
 
-#### Dynamic Embedding Models
-7. **`list_embedding_models`** - List all available embedding models with specs
-8. **`set_collection_embedding_model`** - Assign embedding model to collection
-   - `collection_name` (string): Target collection
-   - `model_name` (string): Embedding model name
+Requirements:
 
-#### Advanced Search & Operations
-9. **`hybrid_search`** - Advanced search with similarity scores and filtering
-   - `query` (string): Search query
-   - `collection_name` (string): Collection to search
-   - `limit` (int): Maximum results (default: 10)
-   - `min_score` (float): Minimum similarity threshold
-   - `include_scores` (bool): Include similarity scores in results
+- Python 3.10 or newer
+- `uv`
+- Docker for the current MCP CLI path, which attempts to auto-start Qdrant
+- macOS, if you want Spotlight/Finder metadata extraction
 
-10. **`scroll_collection`** - Browse collection contents with pagination
-    - `collection_name` (string): Collection to browse
-    - `limit` (int): Entries per page (default: 20)
-    - `offset` (string): Pagination offset (point ID)
-
-11. **`batch_store`** - Store multiple entries efficiently
-    - `entries` (list): List of entries with content, metadata, and optional IDs
-    - `collection_name` (string): Target collection
-
-#### macOS File Ingestion
-12. **`ingest_file`** - Ingest a single file with text extraction + macOS Spotlight metadata
-    - `file_path` (string): Absolute path to the file (.txt, .md, .pdf, .docx)
-    - `collection_name` (string): Target collection
-    - `extra_metadata` (JSON, optional): Additional payload fields to merge in
-    - Extractors: pdfminer.six (primary) → pypdf (fallback) for PDFs, python-docx for Word
-    - Captures Finder tags, content type, authors, dates, source URLs, page count
-
-13. **`ingest_folder`** - Recursively ingest all supported files in a folder
-    - `folder_path` (string): Absolute path to the folder
-    - `collection_name` (string): Target collection
-    - `recursive` (bool, default true): Walk subdirectories
-    - `skip_hidden` (bool, default true): Skip dotfiles and hidden directories
-    - `extra_metadata` (JSON, optional): Applied to every ingested file
-
-#### Document-Level Search
-14. **`search_documents`** - Semantic search with file-level grouping and reranking
-    - `query` (string): Search query
-    - `collection_name` (string): Collection to search
-    - `limit` (int, default 10): Number of distinct documents to return
-    - `chunks_per_document` (int, default 1): Best chunks to surface per document
-    - `filter` (object, optional): High-level filter grammar (`must`/`should`/`must_not`)
-    - Groups chunks by `document_id`, returns the best representative chunk per file with a doc-level score
-
-### Resources
-
-1. **`qdrant://collections`** - Live overview of all collections with statistics
-2. **`qdrant://collection/{collection_name}/schema`** - Detailed schema and configuration for specific collection
-
-### Supported Embedding Models
-
-The server now supports 12+ embedding models with automatic model management:
-
-**Compact Models (384D):**
-- `sentence-transformers/all-MiniLM-L6-v2` - Lightweight, fast general use
-- `sentence-transformers/all-MiniLM-L12-v2` - Better quality than L6
-- `BAAI/bge-small-en-v1.5` - Optimized for English
-- `thenlper/gte-small` - General text embeddings
-- `intfloat/e5-small-v2` - E5 family, efficient
-
-**Balanced Models (768D):**
-- `sentence-transformers/all-mpnet-base-v2` - High quality, balanced
-- `BAAI/bge-base-en-v1.5` - Better English embeddings
-- `thenlper/gte-base` - General text embeddings
-- `intfloat/e5-base-v2` - E5 family, balanced
-
-**High-Quality Models (1024D):**
-- `BAAI/bge-large-en-v1.5` - Highest quality English
-- `thenlper/gte-large` - Large general embeddings
-- `intfloat/e5-large-v2` - E5 family, highest quality
-- `Qwen/Qwen3-Embedding-0.6B` - Qwen3 0.6B, lightweight multilingual
-
-**Premium Models (4096D):**
-- `Qwen/Qwen3-Embedding-8B` - Qwen3 8B, top-tier semantic recall, multilingual + code
-
-> **Note**: Qwen3 models are surfaced via supplemental registry in `embedding_manager.py` and may not appear in `fastembed.list_supported_models()` depending on your fastembed version. The vector size is supplied via a fallback dict in `embeddings/fastembed.py`.
-
-## 📂 macOS File Ingestion
-
-The `ingest_file` and `ingest_folder` tools extract text and capture macOS-native metadata in one step.
-
-### Extractor stack
-
-| Format | Primary | Fallback |
-|---|---|---|
-| `.txt`, `.md` | UTF-8 direct read with charset fallback (utf-8 → utf-8-sig → latin-1 → cp1252); markdown frontmatter is stripped | — |
-| `.pdf` | pdfminer.six | pypdf |
-| `.docx` | python-docx | — |
-
-### Captured metadata
-
-Each chunk's `metadata` payload includes (when available):
-
-| Field | Type | Source | Indexed |
-|---|---|---|---|
-| `path` | keyword | filesystem | ✅ |
-| `filename` | keyword | filesystem | ✅ |
-| `extension` | keyword | filesystem | ✅ |
-| `size_bytes` | integer | filesystem | ✅ |
-| `is_hidden` | bool | filesystem | ✅ |
-| `content_type` | keyword | `kMDItemContentType` | ✅ |
-| `title` | keyword | `kMDItemTitle` | — |
-| `tags` | keyword[] | `kMDItemUserTags` + xattr | ✅ |
-| `authors` | keyword[] | `kMDItemAuthors` | ✅ |
-| `keywords` | keyword[] | `kMDItemKeywords` | ✅ |
-| `comment` | string | `kMDItemComment` | — |
-| `source_urls` | string[] | `kMDItemWhereFroms` | — |
-| `created_at` | keyword (ISO) | `kMDItemFSCreationDate` | ✅ |
-| `modified_at` | keyword (ISO) | `kMDItemFSContentChangeDate` | ✅ |
-| `last_opened_at` | keyword (ISO) | `kMDItemLastUsedDate` | ✅ |
-| `page_count` | integer | `kMDItemNumberOfPages` | ✅ |
-| `duration_seconds` | float | `kMDItemDurationSeconds` | — |
-| `extractor_used` | keyword | runtime | ✅ |
-| `char_count` | integer | runtime | ✅ |
-| `ingested_at` | keyword (ISO) | runtime | ✅ |
-| `document_id` | keyword | hashed path | ✅ |
-| `chunk_index` | integer | runtime | — |
-| `total_chunks` | integer | runtime | — |
-
-Indexes are created idempotently per collection on first ingest. Use `bootstrap_collection_indexes` to create them up front before bulk ingest.
-
-### Filter grammar
-
-`search_documents` accepts a high-level filter object that compiles to Qdrant `must`/`should`/`must_not` clauses:
-
-```json
-{
-  "must": [
-    { "field": "extension", "op": "==", "value": "pdf" },
-    { "field": "modified_at", "op": ">=", "value": "2026-01-01" }
-  ],
-  "should": [
-    { "field": "tags", "op": "any", "value": ["work", "urgent"] }
-  ],
-  "must_not": [
-    { "field": "is_hidden", "op": "==", "value": true }
-  ]
-}
-```
-
-Supported operators: `==`, `!=`, `>`, `>=`, `<`, `<=`, `any`, `except`. Range ops apply to integers and ISO date strings.
-
-**For advanced features with 13 tools and intelligent model management, use the configuration below.**
-
-## 🚀 Quick Start
-
-### Installation Options
-
-#### Option 1: Development Setup (Recommended)
-Clone and run from source. The `mcp-server-qdrant` entry point auto-starts a local Qdrant Docker container on first launch.
+Install dependencies from the repository root:
 
 ```bash
-git clone https://github.com/juangrukat/mcp-server-qdrant-enhanced-MacOS.git
-cd mcp-server-qdrant-enhanced-MacOS
 uv sync
 ```
 
-Claude Desktop config (`~/Library/Application Support/Claude/claude_desktop_config.json`):
+Run tests:
+
+```bash
+uv run pytest
+```
+
+Because the current checkout has the pending `setup_discovery_tools()` call,
+server startup is expected to fail until that code path is fixed.
+
+## Running the MCP server
+
+The CLI entry point is:
+
+```bash
+uv run mcp-server-qdrant
+```
+
+By default it uses MCP stdio, which is the right transport for clients that
+spawn the server process directly, such as Claude Desktop or LM Studio.
+
+Supported transports:
+
+```bash
+uv run mcp-server-qdrant --transport stdio
+uv run mcp-server-qdrant --transport sse --host 127.0.0.1 --port 8000
+uv run mcp-server-qdrant --transport streamable-http --host 127.0.0.1 --port 8000
+```
+
+`--transport http` is accepted as an alias for `streamable-http`.
+
+The CLI currently calls the Docker helper on startup. That helper starts a
+container named `qdrant_mcp_server` from the `qdrant/qdrant` image and stores
+data in `qdrant_storage` under the project root.
+
+## Claude Desktop example
+
+Example configuration:
 
 ```json
 {
   "mcpServers": {
-    "mcp-server-qdrant-enhanced": {
+    "qdrant-enhanced": {
       "command": "uv",
       "args": [
         "--directory",
-        "/Users/YOUR_USERNAME/path/to/mcp-server-qdrant-enhanced-MacOS",
+        "/Users/kat/REPOS/mcp-server-qdrant-enhanced",
         "run",
         "mcp-server-qdrant"
       ],
@@ -226,794 +110,436 @@ Claude Desktop config (`~/Library/Application Support/Claude/claude_desktop_conf
         "QDRANT_URL": "http://localhost:6333",
         "EMBEDDING_PROVIDER": "fastembed",
         "EMBEDDING_MODEL": "sentence-transformers/all-MiniLM-L6-v2",
-        "QDRANT_ENABLE_COLLECTION_MANAGEMENT": "true",
-        "QDRANT_ENABLE_DYNAMIC_EMBEDDING_MODELS": "true",
-        "QDRANT_ENABLE_RESOURCES": "true",
-        "QDRANT_DEFAULT_VECTOR_SIZE": "384",
-        "QDRANT_DEFAULT_DISTANCE_METRIC": "cosine"
+        "QDRANT_MCP_TOOL_PROFILE": "canonical"
       }
     }
   }
 }
 ```
 
-#### Option 2: Qwen3-Embedding-8B (4096D, premium semantic recall)
-Replace the `EMBEDDING_MODEL` and `QDRANT_DEFAULT_VECTOR_SIZE` env vars:
+## HTTP security
 
-```json
-"env": {
-  "QDRANT_URL": "http://localhost:6333",
-  "EMBEDDING_PROVIDER": "fastembed",
-  "EMBEDDING_MODEL": "Qwen/Qwen3-Embedding-8B",
-  "QDRANT_ENABLE_COLLECTION_MANAGEMENT": "true",
-  "QDRANT_ENABLE_DYNAMIC_EMBEDDING_MODELS": "true",
-  "QDRANT_ENABLE_RESOURCES": "true",
-  "QDRANT_DEFAULT_VECTOR_SIZE": "4096",
-  "QDRANT_DEFAULT_DISTANCE_METRIC": "cosine"
-}
-```
+For streamable HTTP, the server binds to `127.0.0.1` by default.
 
-Then create a fresh Qwen collection — do NOT reuse a 384D collection (dimension mismatch will reject embeddings):
+Relevant settings:
 
-```text
-create_collection(collection_name="qwen_docs", embedding_model="Qwen/Qwen3-Embedding-8B")
-```
+- `MCP_HOST`: HTTP bind host. Default: `127.0.0.1`.
+- `MCP_PORT`: HTTP bind port. Default: `8000`.
+- `FASTMCP_PORT`: fallback port env var.
+- `MCP_HTTP_AUTH_TOKEN`: optional bearer token required on HTTP requests.
+- `MCP_HTTP_ALLOWED_ORIGINS`: comma-separated allowed origins for origin checks.
 
-#### Option 3: Embedded (no Docker)
-Use Qdrant in local file mode by setting `QDRANT_LOCAL_PATH` instead of `QDRANT_URL`:
+Use loopback binding for local desktop use.
 
-```json
-"env": {
-  "QDRANT_LOCAL_PATH": "/Users/YOUR_USERNAME/qdrant-data",
-  "EMBEDDING_MODEL": "sentence-transformers/all-MiniLM-L6-v2"
-}
-```
+## Running the REST API
 
-### Web UI / REST API
-
-Start the optional REST server to drive the same operations from a browser or external app:
+The FastAPI entry point mirrors the same Qdrant connector and ingestion
+pipeline:
 
 ```bash
 uv run mcp-server-qdrant-webui --host 127.0.0.1 --port 8765
 ```
 
-Endpoints (full schema at `/docs`):
+OpenAPI docs are available at:
 
-| Method | Path | Description |
-|---|---|---|
-| GET | `/collections` | List collections |
-| GET | `/collections/{name}` | Collection info |
-| POST | `/collections` | Create collection |
-| DELETE | `/collections/{name}` | Delete collection |
-| POST | `/search` | Hybrid semantic search |
-| POST | `/search_documents` | Document-grouped search |
-| POST | `/store` | Single-entry store |
-| POST | `/store_batch` | Batch store |
-| GET | `/scroll/{name}` | Browse with pagination |
-| POST | `/ingest/file` | Ingest a file path |
-| POST | `/ingest/folder` | Ingest a folder |
-| GET | `/embedding_models` | List models |
-
-### Deployment Modes
-
-Choose the deployment mode that best fits your needs:
-
-#### 🧠 Memory Mode (Fastest)
-Perfect for testing and development:
-```bash
-export QDRANT_MODE=memory
-uv run mcp-server-qdrant --transport sse
+```text
+http://127.0.0.1:8765/docs
 ```
 
-#### 💾 Local File Mode (Persistent)
-Data persists between restarts:
-```bash
-export QDRANT_MODE=local
-uv run mcp-server-qdrant --transport sse
-```
+REST endpoints include:
 
-#### 🐳 Auto-Managed Docker (Recommended)
-Full Qdrant features with automatic setup:
-```bash
-export QDRANT_MODE=docker
-export QDRANT_AUTO_DOCKER=true
-uv run mcp-server-qdrant --transport sse
-```
+- `GET /health`
+- `GET /collections`
+- `GET /collections/{name}`
+- `POST /collections`
+- `DELETE /collections/{name}`
+- `POST /collections/{name}/bootstrap_indexes`
+- `POST /store`
+- `POST /store_batch`
+- `GET /scroll/{name}`
+- `POST /search`
+- `POST /search_documents`
+- `POST /ingest/file`
+- `POST /ingest/folder`
+- `GET /embedding_models`
+- `POST /embedding_models/active`
 
-#### 🌐 External Qdrant (Production)
-Connect to existing Qdrant instance:
-```bash
-export QDRANT_URL=http://your-qdrant-server:6333
-uv run mcp-server-qdrant --transport sse
-```
+## MCP tool profiles
 
-### Claude Desktop Configuration
-
-Add to your `claude_desktop_config.json`:
-
-```json
-{
-  "mcpServers": {
-    "mcp-server-qdrant": {
-      "command": "uv",
-      "args": [
-        "--directory",
-        "/home/your-username/Repositories/mcp-server-qdrant/src",
-        "run",
-        "mcp-server-qdrant"
-      ],
-      "env": {
-        "QDRANT_MODE": "docker",
-        "QDRANT_AUTO_DOCKER": "true",
-        "QDRANT_API_KEY": "",
-        "QDRANT_ENABLE_COLLECTION_MANAGEMENT": "true",
-        "QDRANT_ENABLE_DYNAMIC_EMBEDDING_MODELS": "true",
-        "QDRANT_ENABLE_RESOURCES": "true"
-      }
-    }
-  }
-}
-```
-
-### LM Studio Configuration
-
-Add to your LM Studio MCP settings:
-
-```json
-{
-  "mcpServers": {
-    "mcp-server-qdrant": {
-      "command": "uv",
-      "args": [
-        "--directory",
-        "/home/your-username/Repositories/mcp-server-qdrant/src",
-        "run",
-        "mcp-server-qdrant",
-        "--transport",
-        "stdio"
-      ],
-      "env": {
-        "QDRANT_MODE": "embedded",
-        "QDRANT_COLLECTION_NAME": "lm_studio_memories",
-        "QDRANT_ENABLE_COLLECTION_MANAGEMENT": "true",
-        "QDRANT_ENABLE_DYNAMIC_EMBEDDING_MODELS": "true",
-        "QDRANT_ENABLE_RESOURCES": "true"
-      }
-    }
-  }
-}
-```
-
-**Alternative using installed package:**
-```json
-{
-  "mcpServers": {
-    "mcp-server-qdrant": {
-      "command": "uvx",
-      "args": [
-        "mcp-server-qdrant",
-        "--transport",
-        "stdio"
-      ],
-      "env": {
-        "QDRANT_MODE": "embedded",
-        "QDRANT_COLLECTION_NAME": "lm_studio_memories",
-        "QDRANT_ENABLE_COLLECTION_MANAGEMENT": "true",
-        "QDRANT_ENABLE_DYNAMIC_EMBEDDING_MODELS": "true"
-      }
-    }
-  }
-}
-```
-
-## Environment Variables
-
-The configuration of the server is done using environment variables:
-
-### Core Configuration
-| Name                     | Description                                                         | Default Value                                                     |
-|--------------------------|---------------------------------------------------------------------|-------------------------------------------------------------------|
-| `QDRANT_URL`             | URL of the Qdrant server                                            | None                                                              |
-| `QDRANT_API_KEY`         | API key for the Qdrant server                                       | None                                                              |
-| `COLLECTION_NAME`        | Name of the default collection to use (optional for multi-collection mode) | None                                                              |
-| `QDRANT_LOCAL_PATH`      | Path to the local Qdrant database (alternative to `QDRANT_URL`)     | None                                                              |
-| `EMBEDDING_PROVIDER`     | Embedding provider to use (currently only "fastembed" is supported) | `fastembed`                                                       |
-
-> [!NOTE]
-> **Automatic Model Selection**: `EMBEDDING_MODEL` is no longer required. The system automatically selects appropriate models and remembers them per collection.
-
-### Enhanced Features Configuration
-| Name                                        | Description                                                  | Default Value |
-|--------------------------------------------|--------------------------------------------------------------|---------------|
-| `QDRANT_ENABLE_COLLECTION_MANAGEMENT`      | Enable collection management tools                           | `true`        |
-| `QDRANT_ENABLE_DYNAMIC_EMBEDDING_MODELS`   | Enable dynamic embedding model assignment per collection     | `true`        |
-| `QDRANT_ENABLE_RESOURCES`                  | Enable MCP resources for collection information             | `true`        |
-| `QDRANT_MAX_BATCH_SIZE`                    | Maximum number of entries per batch operation               | `100`         |
-| `QDRANT_SEARCH_LIMIT`                      | Default maximum search results                               | `10`          |
-| `QDRANT_READ_ONLY`                         | Enable read-only mode (disables write operations)           | `false`       |
-| `QDRANT_ALLOW_ARBITRARY_FILTER`            | Allow arbitrary filtering in search                         | `false`       |
-
-### Tool Descriptions (Customizable)
-| Name                                        | Description                                    | Default Value |
-|--------------------------------------------|------------------------------------------------|---------------|
-| `TOOL_STORE_DESCRIPTION`                   | Custom description for the store tool         | See defaults  |
-| `TOOL_FIND_DESCRIPTION`                    | Custom description for the find tool          | See defaults  |
-| `TOOL_BATCH_STORE_DESCRIPTION`             | Custom description for batch store tool       | See defaults  |
-| `TOOL_LIST_COLLECTIONS_DESCRIPTION`        | Custom description for list collections tool  | See defaults  |
-| `TOOL_CREATE_COLLECTION_DESCRIPTION`       | Custom description for create collection tool | See defaults  |
-| `TOOL_DELETE_COLLECTION_DESCRIPTION`       | Custom description for delete collection tool | See defaults  |
-| `TOOL_HYBRID_SEARCH_DESCRIPTION`           | Custom description for hybrid search tool     | See defaults  |
-| `TOOL_SCROLL_DESCRIPTION`                  | Custom description for scroll collection tool | See defaults  |
-| `TOOL_LIST_EMBEDDING_MODELS_DESCRIPTION`   | Custom description for list models tool       | See defaults  |
-
-All tool descriptions have sensible defaults defined in [`settings.py`](src/mcp_server_qdrant/settings.py).
-
-OLD- Note: You cannot provide both `QDRANT_URL` and `QDRANT_LOCAL_PATH` at the same time.
-
-## Port Management
-
-The enhanced server includes intelligent port management to avoid conflicts:
-
-### Automatic Port Detection (Recommended)
-The server automatically detects if the default port (8000) is busy and finds an alternative:
-
-```json
-{
-  "env": {
-    "FASTMCP_PORT": "8000"
-  }
-}
-```
-
-If port 8000 is busy, the server will automatically use ports 8001, 8002, etc. You'll see:
-```
-⚠️  Port 8000 was busy. MCP server will use port 8001
-🚀 MCP Server starting on http://localhost:8001
-📡 SSE endpoint: http://localhost:8001/sse
-```
-
-### Manual Port Override
-To force a specific port (disables auto-detection):
-
-```json
-{
-  "env": {
-    "FASTMCP_PORT": "9000"
-  }
-}
-```
-
-### No Port Specified (Full Auto-Detection)
-Omit `FASTMCP_PORT` entirely for complete automatic port assignment:
-
-```json
-{
-  "env": {
-    "QDRANT_URL": "http://localhost:6333"
-  }
-}
-```
-
-The server will scan ports 8000-8099 and use the first available port.
-
-## Usage Examples
-
-### Multi-Collection Workflow
-```python
-# List available collections
-collections = await list_collections()
-
-# Create a specialized collection for code snippets
-await create_collection(
-    collection_name="code_snippets",
-    vector_size=768,
-    distance="cosine"
-)
-
-# Create another collection for documentation
-await create_collection(
-    collection_name="documentation",
-    vector_size=384
-)
-
-# Store data in different collections
-# The system automatically selects and remembers appropriate embedding models
-await store("Python function for sorting", "code_snippets")
-await store("API documentation for REST endpoints", "documentation")
-```
-
-### Advanced Search with Scoring
-```python
-# Perform hybrid search with similarity scores
-results = await hybrid_search(
-    query="authentication methods",
-    collection_name="documentation",
-    limit=5,
-    min_score=0.7,
-    include_scores=True
-)
-```
-
-### Batch Operations
-```python
-# Store multiple entries efficiently
-entries = [
-    {"content": "Function to validate emails", "metadata": {"type": "utility"}},
-    {"content": "Database connection helper", "metadata": {"type": "database"}},
-    {"content": "Error handling middleware", "metadata": {"type": "middleware"}}
-]
-await batch_store(entries, "code_snippets")
-```
-
-### Collection Management
-```python
-# Get detailed collection information
-info = await get_collection_info("code_snippets")
-
-# Browse collection contents
-await scroll_collection("code_snippets", limit=10)
-
-# View available embedding models
-await list_embedding_models()
-
-# Check which model a collection is using
-# The system automatically tracks this information
-```
-
-> [!IMPORTANT]
-> Command-line arguments are not supported anymore! Please use environment variables for all configuration.
-
-### FastMCP Environment Variables
-
-Since `mcp-server-qdrant` is based on FastMCP, it also supports all the FastMCP environment variables. The most
-important ones are listed below:
-
-| Environment Variable                  | Description                                               | Default Value |
-|---------------------------------------|-----------------------------------------------------------|---------------|
-| `FASTMCP_DEBUG`                       | Enable debug mode                                         | `false`       |
-| `FASTMCP_LOG_LEVEL`                   | Set logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL) | `INFO`        |
-| `FASTMCP_HOST`                        | Host address to bind the server to                        | `0.0.0.0`     |
-| `FASTMCP_PORT`                        | Port to run the server on (auto-detects if busy)          | `8000`        |
-| `FASTMCP_WARN_ON_DUPLICATE_RESOURCES` | Show warnings for duplicate resources                     | `true`        |
-| `FASTMCP_WARN_ON_DUPLICATE_TOOLS`     | Show warnings for duplicate tools                         | `true`        |
-| `FASTMCP_WARN_ON_DUPLICATE_PROMPTS`   | Show warnings for duplicate prompts                       | `true`        |
-| `FASTMCP_DEPENDENCIES`                | List of dependencies to install in the server environment | `[]`          |
-
-## Installation- Old
-
-**It should remain backward compatible but not sure**
-
-### Using uvx
-
-When using [`uvx`](https://docs.astral.sh/uv/guides/tools/#running-tools) no specific installation is needed to directly run *mcp-server-qdrant*.
-
-```shell
-QDRANT_URL="http://localhost:6333" \
-COLLECTION_NAME="my-collection" \
-EMBEDDING_MODEL="sentence-transformers/all-MiniLM-L6-v2" \
-uvx mcp-server-qdrant
-```
-
-#### Transport Protocols
-
-The server supports different transport protocols that can be specified using the `--transport` flag:
-
-```shell
-QDRANT_URL="http://localhost:6333" \
-COLLECTION_NAME="my-collection" \
-uvx mcp-server-qdrant --transport sse
-```
-
-Supported transport protocols:
-
-- `stdio` (default): Standard input/output transport, might only be used by local MCP clients
-- `sse`: Server-Sent Events transport, perfect for remote clients
-- `streamable-http`: Streamable HTTP transport, perfect for remote clients, more recent than SSE
-
-The default transport is `stdio` if not specified.
-
-When SSE transport is used, the server will listen on the specified port and wait for incoming connections. The default
-port is 8000, however it can be changed using the `FASTMCP_PORT` environment variable.
-
-```shell
-QDRANT_URL="http://localhost:6333" \
-COLLECTION_NAME="my-collection" \
-FASTMCP_PORT=1234 \
-uvx mcp-server-qdrant --transport sse
-```
-
-### OLD- Using Docker
-
-A Dockerfile is available for building and running the MCP server:
+The server has a profile gate so clients can expose a smaller or larger tool
+surface. Configure it with:
 
 ```bash
-# Build the container
-docker build -t mcp-server-qdrant .
-
-# Run the container
-docker run -p 8000:8000 \
-  -e QDRANT_URL="http://your-qdrant-server:6333" \
-  -e QDRANT_API_KEY="your-api-key" \
-  -e COLLECTION_NAME="your-collection" \
-  mcp-server-qdrant
+QDRANT_MCP_TOOL_PROFILE=minimal
+QDRANT_MCP_TOOL_PROFILE=canonical
+QDRANT_MCP_TOOL_PROFILE=full
 ```
 
-### OLD- Installing via Smithery
+The default is `canonical`.
 
-> [!WARNING]
-> **The [Smithery](https://smithery.ai/protocol/mcp-server-qdrant) installation installs the original limited version with only basic store/find functionality, not this enhanced fork with collection management and dynamic embedding models.**
+Profile intent:
 
-To install the original basic version via Smithery:
+- `minimal`: daily ingestion, document search, model listing, collection info.
+- `canonical`: minimal plus collection creation, hybrid setup, index bootstrap,
+  and active embedding model switching.
+- `full`: canonical plus raw chunk-level storage/search/admin tools.
 
-```bash
-npx @smithery/cli install mcp-server-qdrant --client claude
-```
+Configured profile mapping:
 
-#### Single Collection Mode (Backward Compatible)
+| Tool | Minimal | Canonical | Full |
+| --- | --- | --- | --- |
+| `search_documents` | yes | yes | yes |
+| `ingest_file` | yes | yes | yes |
+| `ingest_folder` | yes | yes | yes |
+| `list_embedding_models` | yes | yes | yes |
+| `get_collection_info` | yes | yes | yes |
+| `list_collections` | yes | yes | yes |
+| `create_collection` | no | yes | yes |
+| `create_hybrid_collection` | no | yes | yes |
+| `bootstrap_collection_indexes` | no | yes | yes |
+| `set_collection_embedding_model` | no | yes | yes |
+| `delete_collection` | no | no | yes |
+| `qdrant_find` | no | no | yes |
+| `qdrant_store` | no | no | yes |
+| `qdrant_store_batch` | no | no | yes |
+| `scroll_collection` | no | no | yes |
+| `hybrid_search` | no | no | yes |
 
-For compatibility with existing setups using a single default collection:
+The profile map also lists discovery tools such as `get_indexed_fields` and
+`get_server_capabilities`, but those are part of the incomplete discovery-tool
+integration in the current checkout.
+
+## Main MCP tools
+
+### Document search
+
+`search_documents` is the preferred search tool.
+
+It overfetches raw chunk hits, groups them by `metadata.document_id`, and
+returns distinct documents ranked by their best representative chunks.
+
+Arguments:
+
+- `query`: semantic search query.
+- `collection_name`: collection to search.
+- `limit`: number of distinct documents to return. Default: `10`.
+- `chunks_per_document`: number of best chunks to include per document.
+  Default: `1`.
+- `filter`: optional high-level filter object.
+- `mode`: `dense`, `hybrid`, `rerank`, or reserved `late_interaction`.
+- `reranker_model`: optional reranker for `mode="rerank"`.
+
+Search modes:
+
+- `dense`: dense vector search with the active FastEmbed model.
+- `hybrid`: dense + sparse BM25 search fused with reciprocal rank fusion.
+- `rerank`: hybrid first stage followed by a cross-encoder reranker.
+- `late_interaction`: reserved for future ColBERT-style retrieval.
+
+### File ingestion
+
+`ingest_file` extracts text from one file, captures metadata, chunks the text,
+and stores all chunks in Qdrant.
+
+Arguments:
+
+- `file_path`: absolute path.
+- `collection_name`: target collection.
+- `extra_metadata`: optional JSON string merged into every chunk.
+- `mode`: `dense` or `hybrid`.
+
+`ingest_folder` recursively ingests supported files from a directory.
+
+Arguments:
+
+- `folder_path`: absolute path.
+- `collection_name`: target collection.
+- `recursive`: default `true`.
+- `skip_hidden`: default `true`.
+- `extra_metadata`: optional JSON string merged into every file.
+- `mode`: `dense` or `hybrid`.
+
+Supported file types:
+
+| Extension | Extractor |
+| --- | --- |
+| `.txt` | direct text read with charset fallback |
+| `.md` | direct text read, YAML/TOML frontmatter stripped |
+| `.pdf` | `pdfminer.six`, with `pypdf` fallback |
+| `.docx` | `python-docx` |
+
+Chunking is paragraph-aware with a target size of 1500 characters and 150
+characters of overlap.
+
+### Collection tools
+
+`list_collections` lists available Qdrant collections.
+
+`get_collection_info` returns point/vector counts, status, vector size, and
+distance metric.
+
+`create_collection` creates a dense-vector collection from an embedding model.
+The vector size is inferred from the model unless `vector_size` is provided.
+
+`create_hybrid_collection` creates a collection with:
+
+- One dense vector slot using the selected FastEmbed model.
+- One sparse vector slot using `Qdrant/bm25` by default.
+
+`bootstrap_collection_indexes` creates payload indexes for the standard macOS
+metadata fields.
+
+`delete_collection` is only exposed in the `full` profile and requires
+`confirm=true`.
+
+### Embedding model tools
+
+`list_embedding_models` asks FastEmbed for supported dense models and appends
+supplemental Qwen3 entries.
+
+`set_collection_embedding_model` switches the active provider for subsequent
+store and search operations. Despite the historical name, the current
+implementation switches the active model on the server instance; it does not
+persist a per-collection model mapping.
+
+### Raw tools
+
+The `full` profile exposes raw chunk-level tools:
+
+- `qdrant_store`
+- `qdrant_find`
+- `qdrant_store_batch`
+- `scroll_collection`
+- `hybrid_search`
+
+These are useful for diagnostics and low-level manipulation, but
+`search_documents` and the ingestion tools are the preferred high-level path.
+
+## Response envelope
+
+Priority tools return a versioned JSON envelope:
 
 ```json
 {
-  "qdrant": {
-    "command": "uvx",
-    "args": ["mcp-server-qdrant"],
-    "env": {
-      "QDRANT_URL": "https://xyz-example.eu-central.aws.cloud.qdrant.io:6333",
-      "QDRANT_API_KEY": "your_api_key",
-      "COLLECTION_NAME": "your-collection-name"
-    }
-  }
-}
-```
-#### Local Qdrant Setup
-
-For local development with enhanced features:
-
-```json
-{
-  "mcp-server-qdrant": {
-    "command": "uv",
-    "args": [
-      "--directory",
-      "/path/to/your/mcp-server-qdrant/src",
-      "run",
-      "mcp-server-qdrant"
-    ],
-    "env": {
-      "QDRANT_LOCAL_PATH": "/tmp/qdrant_storage",
-      "QDRANT_ENABLE_COLLECTION_MANAGEMENT": "true",
-      "QDRANT_ENABLE_DYNAMIC_EMBEDDING_MODELS": "true",
-      "QDRANT_ENABLE_RESOURCES": "true"
-    }
-  }
-}
-```
-
-This MCP server will automatically create collections and select appropriate embedding models as needed.
-
-## Support for other tools
-
-This MCP server can be used with any MCP-compatible client. For example, you can use it with
-[Cursor](https://docs.cursor.com/context/model-context-protocol) and [VS Code](https://code.visualstudio.com/docs), which provide built-in support for the Model Context
-Protocol.
-
-### Using with Cursor/Windsurf
-
-You can configure this MCP server to work as a code search tool for Cursor or Windsurf by customizing the tool
-descriptions:
-
-```bash
-QDRANT_URL="http://localhost:6333" \
-COLLECTION_NAME="code-snippets" \
-TOOL_STORE_DESCRIPTION="Store reusable code snippets for later retrieval. \
-The 'information' parameter should contain a natural language description of what the code does, \
-while the actual code should be included in the 'metadata' parameter as a 'code' property. \
-The value of 'metadata' is a Python dictionary with strings as keys. \
-Use this whenever you generate some code snippet." \
-TOOL_FIND_DESCRIPTION="Search for relevant code snippets based on natural language descriptions. \
-The 'query' parameter should describe what you're looking for, \
-and the tool will return the most relevant code snippets. \
-Use this when you need to find existing code snippets for reuse or reference." \
-uvx mcp-server-qdrant --transport sse # Enable SSE transport
-```
-
-In Cursor/Windsurf, you can then configure the MCP server in your settings by pointing to this running server using
-SSE transport protocol. The description on how to add an MCP server to Cursor can be found in the [Cursor
-documentation](https://docs.cursor.com/context/model-context-protocol#adding-an-mcp-server-to-cursor). If you are
-running Cursor/Windsurf locally, you can use the following URL:
-
-```
-http://localhost:8000/sse
-```
-
-> [!TIP]
-> We suggest SSE transport as a preferred way to connect Cursor/Windsurf to the MCP server, as it can support remote
-> connections. That makes it easy to share the server with your team or use it in a cloud environment.
-
-This configuration transforms the Qdrant MCP server into a specialized code search tool that can:
-
-1. Store code snippets, documentation, and implementation details
-2. Retrieve relevant code examples based on semantic search
-3. Help developers find specific implementations or usage patterns
-
-You can populate the database by storing natural language descriptions of code snippets (in the `information` parameter)
-along with the actual code (in the `metadata.code` property), and then search for them using natural language queries
-that describe what you're looking for.
-
-> [!NOTE]
-> The tool descriptions provided above are examples and may need to be customized for your specific use case. Consider
-> adjusting the descriptions to better match your team's workflow and the specific types of code snippets you want to
-> store and retrieve.
-
-**If you have successfully installed the `mcp-server-qdrant`, but still can't get it to work with Cursor, please
-consider creating the [Cursor rules](https://docs.cursor.com/context/rules-for-ai) so the MCP tools are always used when
-the agent produces a new code snippet.** You can restrict the rules to only work for certain file types, to avoid using
-the MCP server for the documentation or other types of content.
-
-### Using with Claude Code
-
-You can enhance Claude Code's capabilities by connecting it to this MCP server, enabling semantic search over your
-existing codebase.
-
-#### Setting up mcp-server-qdrant
-
-1. Add the MCP server to Claude Code:
-
-    ```shell
-    # Add mcp-server-qdrant configured for code search
-    claude mcp add code-search \
-    -e QDRANT_URL="http://localhost:6333" \
-    -e COLLECTION_NAME="code-repository" \
-    -e EMBEDDING_MODEL="sentence-transformers/all-MiniLM-L6-v2" \
-    -e TOOL_STORE_DESCRIPTION="Store code snippets with descriptions. The 'information' parameter should contain a natural language description of what the code does, while the actual code should be included in the 'metadata' parameter as a 'code' property." \
-    -e TOOL_FIND_DESCRIPTION="Search for relevant code snippets using natural language. The 'query' parameter should describe the functionality you're looking for." \
-    -- uvx mcp-server-qdrant
-    ```
-
-2. Verify the server was added:
-
-    ```shell
-    claude mcp list
-    ```
-
-#### Using Semantic Code Search in Claude Code
-
-Tool descriptions, specified in `TOOL_STORE_DESCRIPTION` and `TOOL_FIND_DESCRIPTION`, guide Claude Code on how to use
-the MCP server. The ones provided above are examples and may need to be customized for your specific use case. However,
-Claude Code should be already able to:
-
-1. Use the `qdrant-store` tool to store code snippets with descriptions.
-2. Use the `qdrant-find` tool to search for relevant code snippets using natural language.
-
-### Run MCP server in Development Mode
-
-The MCP server can be run in development mode using the `mcp dev` command. This will start the server and open the MCP
-inspector in your browser.
-
-```shell
-COLLECTION_NAME=mcp-dev fastmcp dev src/mcp_server_qdrant/server.py
-```
-
-### Using with VS Code
-
-For one-click installation, click one of the install buttons below:
-
-[![Install with UVX in VS Code](https://img.shields.io/badge/VS_Code-UVX-0098FF?style=flat-square&logo=visualstudiocode&logoColor=white)](https://insiders.vscode.dev/redirect/mcp/install?name=qdrant&config=%7B%22command%22%3A%22uvx%22%2C%22args%22%3A%5B%22mcp-server-qdrant%22%5D%2C%22env%22%3A%7B%22QDRANT_URL%22%3A%22%24%7Binput%3AqdrantUrl%7D%22%2C%22QDRANT_API_KEY%22%3A%22%24%7Binput%3AqdrantApiKey%7D%22%2C%22COLLECTION_NAME%22%3A%22%24%7Binput%3AcollectionName%7D%22%7D%7D&inputs=%5B%7B%22type%22%3A%22promptString%22%2C%22id%22%3A%22qdrantUrl%22%2C%22description%22%3A%22Qdrant+URL%22%7D%2C%7B%22type%22%3A%22promptString%22%2C%22id%22%3A%22qdrantApiKey%22%2C%22description%22%3A%22Qdrant+API+Key%22%2C%22password%22%3Atrue%7D%2C%7B%22type%22%3A%22promptString%22%2C%22id%22%3A%22collectionName%22%2C%22description%22%3A%22Collection+Name%22%7D%5D) [![Install with UVX in VS Code Insiders](https://img.shields.io/badge/VS_Code_Insiders-UVX-24bfa5?style=flat-square&logo=visualstudiocode&logoColor=white)](https://insiders.vscode.dev/redirect/mcp/install?name=qdrant&config=%7B%22command%22%3A%22uvx%22%2C%22args%22%3A%5B%22mcp-server-qdrant%22%5D%2C%22env%22%3A%7B%22QDRANT_URL%22%3A%22%24%7Binput%3AqdrantUrl%7D%22%2C%22QDRANT_API_KEY%22%3A%22%24%7Binput%3AqdrantApiKey%7D%22%2C%22COLLECTION_NAME%22%3A%22%24%7Binput%3AcollectionName%7D%22%7D%7D&inputs=%5B%7B%22type%22%3A%22promptString%22%2C%22id%22%3A%22qdrantUrl%22%2C%22description%22%3A%22Qdrant+URL%22%7D%2C%7B%22type%22%3A%22promptString%22%2C%22id%22%3A%22qdrantApiKey%22%2C%22description%22%3A%22Qdrant+API+Key%22%2C%22password%22%3Atrue%7D%2C%7B%22type%22%3A%22promptString%22%2C%22id%22%3A%22collectionName%22%2C%22description%22%3A%22Collection+Name%22%7D%5D&quality=insiders)
-
-[![Install with Docker in VS Code](https://img.shields.io/badge/VS_Code-Docker-0098FF?style=flat-square&logo=visualstudiocode&logoColor=white)](https://insiders.vscode.dev/redirect/mcp/install?name=qdrant&config=%7B%22command%22%3A%22docker%22%2C%22args%22%3A%5B%22run%22%2C%22-p%22%2C%228000%3A8000%22%2C%22-i%22%2C%22--rm%22%2C%22-e%22%2C%22QDRANT_URL%22%2C%22-e%22%2C%22QDRANT_API_KEY%22%2C%22-e%22%2C%22COLLECTION_NAME%22%2C%22mcp-server-qdrant%22%5D%2C%22env%22%3A%7B%22QDRANT_URL%22%3A%22%24%7Binput%3AqdrantUrl%7D%22%2C%22QDRANT_API_KEY%22%3A%22%24%7Binput%3AqdrantApiKey%7D%22%2C%22COLLECTION_NAME%22%3A%22%24%7Binput%3AcollectionName%7D%22%7D%7D&inputs=%5B%7B%22type%22%3A%22promptString%22%2C%22id%22%3A%22qdrantUrl%22%2C%22description%22%3A%22Qdrant+URL%22%7D%2C%7B%22type%22%3A%22promptString%22%2C%22id%22%3A%22qdrantApiKey%22%2C%22description%22%3A%22Qdrant+API+Key%22%2C%22password%22%3Atrue%7D%2C%7B%22type%22%3A%22promptString%22%2C%22id%22%3A%22collectionName%22%2C%22description%22%3A%22Collection+Name%22%7D%5D) [![Install with Docker in VS Code Insiders](https://img.shields.io/badge/VS_Code_Insiders-Docker-24bfa5?style=flat-square&logo=visualstudiocode&logoColor=white)](https://insiders.vscode.dev/redirect/mcp/install?name=qdrant&config=%7B%22command%22%3A%22docker%22%2C%22args%22%3A%5B%22run%22%2C%22-p%22%2C%228000%3A8000%22%2C%22-i%22%2C%22--rm%22%2C%22-e%22%2C%22QDRANT_URL%22%2C%22-e%22%2C%22QDRANT_API_KEY%22%2C%22-e%22%2C%22COLLECTION_NAME%22%2C%22mcp-server-qdrant%22%5D%2C%22env%22%3A%7B%22QDRANT_URL%22%3A%22%24%7Binput%3AqdrantUrl%7D%22%2C%22QDRANT_API_KEY%22%3A%22%24%7Binput%3AqdrantApiKey%7D%22%2C%22COLLECTION_NAME%22%3A%22%24%7Binput%3AcollectionName%7D%22%7D%7D&inputs=%5B%7B%22type%22%3A%22promptString%22%2C%22id%22%3A%22qdrantUrl%22%2C%22description%22%3A%22Qdrant+URL%22%7D%2C%7B%22type%22%3A%22promptString%22%2C%22id%22%3A%22qdrantApiKey%22%2C%22description%22%3A%22Qdrant+API+Key%22%2C%22password%22%3Atrue%7D%2C%7B%22type%22%3A%22promptString%22%2C%22id%22%3A%22collectionName%22%2C%22description%22%3A%22Collection+Name%22%7D%5D&quality=insiders)
-
-#### Manual Installation
-
-Add the following JSON block to your User Settings (JSON) file in VS Code. You can do this by pressing `Ctrl + Shift + P` and typing `Preferences: Open User Settings (JSON)`.
-
-```json
-{
-  "mcp": {
-    "inputs": [
-      {
-        "type": "promptString",
-        "id": "qdrantUrl",
-        "description": "Qdrant URL"
-      },
-      {
-        "type": "promptString",
-        "id": "qdrantApiKey",
-        "description": "Qdrant API Key",
-        "password": true
-      },
-      {
-        "type": "promptString",
-        "id": "collectionName",
-        "description": "Collection Name"
-      }
-    ],
-    "servers": {
-      "qdrant": {
-        "command": "uvx",
-        "args": ["mcp-server-qdrant"],
-        "env": {
-          "QDRANT_URL": "${input:qdrantUrl}",
-          "QDRANT_API_KEY": "${input:qdrantApiKey}",
-          "COLLECTION_NAME": "${input:collectionName}"
-        }
-      }
-    }
+  "contract": {
+    "contract_version": "1.0",
+    "toolset_version": "0.8.0",
+    "profile": "canonical"
+  },
+  "data": {},
+  "observability": {
+    "duration_ms": 12,
+    "warnings": [],
+    "stats": {}
   }
 }
 ```
 
-Or if you prefer using Docker, add this configuration instead:
+Failures use the same outer structure with `error` instead of `data`:
 
 ```json
 {
-  "mcp": {
-    "inputs": [
-      {
-        "type": "promptString",
-        "id": "qdrantUrl",
-        "description": "Qdrant URL"
-      },
-      {
-        "type": "promptString",
-        "id": "qdrantApiKey",
-        "description": "Qdrant API Key",
-        "password": true
-      },
-      {
-        "type": "promptString",
-        "id": "collectionName",
-        "description": "Collection Name"
-      }
-    ],
-    "servers": {
-      "qdrant": {
-        "command": "docker",
-        "args": [
-          "run",
-          "-p", "8000:8000",
-          "-i",
-          "--rm",
-          "-e", "QDRANT_URL",
-          "-e", "QDRANT_API_KEY",
-          "-e", "COLLECTION_NAME",
-          "mcp-server-qdrant"
-        ],
-        "env": {
-          "QDRANT_URL": "${input:qdrantUrl}",
-          "QDRANT_API_KEY": "${input:qdrantApiKey}",
-          "COLLECTION_NAME": "${input:collectionName}"
-        }
-      }
-    }
+  "contract": {
+    "contract_version": "1.0",
+    "toolset_version": "0.8.0",
+    "profile": "canonical"
+  },
+  "error": {
+    "code": "invalid_argument",
+    "message": "Unsupported search mode",
+    "retryable": false
+  },
+  "observability": {
+    "duration_ms": 4,
+    "warnings": [],
+    "stats": {}
   }
 }
 ```
 
-Alternatively, you can create a `.vscode/mcp.json` file in your workspace with the following content:
+Some legacy/raw tools still return strings or lists of strings.
+
+## macOS metadata
+
+During file ingestion, the server reads filesystem metadata, Spotlight metadata
+via `mdls`, and Finder tags via extended attributes when available.
+
+Common metadata fields:
+
+| Field | Description |
+| --- | --- |
+| `metadata.document_id` | stable SHA-1-based file identifier |
+| `metadata.path` | absolute source path |
+| `metadata.parent_path` | parent folder |
+| `metadata.filename` | filename with extension |
+| `metadata.extension` | lowercase extension without dot |
+| `metadata.size_bytes` | file size |
+| `metadata.is_hidden` | dotfile/hidden flag |
+| `metadata.has_text` | extraction produced text |
+| `metadata.content_type` | Spotlight content type |
+| `metadata.title` | Spotlight title |
+| `metadata.tags` | Finder/Spotlight tags |
+| `metadata.authors` | Spotlight authors |
+| `metadata.keywords` | Spotlight keywords |
+| `metadata.comment` | Spotlight comment |
+| `metadata.source_urls` | Spotlight where-from URLs |
+| `metadata.created_at` | ISO timestamp |
+| `metadata.modified_at` | ISO timestamp |
+| `metadata.last_opened_at` | ISO timestamp |
+| `metadata.page_count` | page count when available |
+| `metadata.extractor_used` | extraction backend |
+| `metadata.char_count` | extracted character count |
+| `metadata.ingested_at` | ingestion timestamp |
+| `metadata.chunk_index` | chunk number within document |
+| `metadata.total_chunks` | total chunks for document |
+
+The index bootstrap path creates Qdrant payload indexes for the common
+filterable fields.
+
+## Filter grammar
+
+`search_documents` and the REST search endpoints accept a high-level filter
+shape:
 
 ```json
 {
-  "inputs": [
-    {
-      "type": "promptString",
-      "id": "qdrantUrl",
-      "description": "Qdrant URL"
-    },
-    {
-      "type": "promptString",
-      "id": "qdrantApiKey",
-      "description": "Qdrant API Key",
-      "password": true
-    },
-    {
-      "type": "promptString",
-      "id": "collectionName",
-      "description": "Collection Name"
-    }
+  "must": [
+    { "field": "extension", "op": "==", "value": "pdf" },
+    { "field": "modified_at", "op": ">=", "value": "2026-01-01T00:00:00Z" }
   ],
-  "servers": {
-    "qdrant": {
-      "command": "uvx",
-      "args": ["mcp-server-qdrant"],
-      "env": {
-        "QDRANT_URL": "${input:qdrantUrl}",
-        "QDRANT_API_KEY": "${input:qdrantApiKey}",
-        "COLLECTION_NAME": "${input:collectionName}"
-      }
-    }
-  }
-}
-```
-
-For workspace configuration with Docker, use this in `.vscode/mcp.json`:
-
-```json
-{
-  "inputs": [
-    {
-      "type": "promptString",
-      "id": "qdrantUrl",
-      "description": "Qdrant URL"
-    },
-    {
-      "type": "promptString",
-      "id": "qdrantApiKey",
-      "description": "Qdrant API Key",
-      "password": true
-    },
-    {
-      "type": "promptString",
-      "id": "collectionName",
-      "description": "Collection Name"
-    }
+  "should": [
+    { "field": "tags", "op": "any", "value": ["work", "reference"] }
   ],
-  "servers": {
-    "qdrant": {
-      "command": "docker",
-      "args": [
-        "run",
-        "-p", "8000:8000",
-        "-i",
-        "--rm",
-        "-e", "QDRANT_URL",
-        "-e", "QDRANT_API_KEY",
-        "-e", "COLLECTION_NAME",
-        "mcp-server-qdrant"
-      ],
-      "env": {
-        "QDRANT_URL": "${input:qdrantUrl}",
-        "QDRANT_API_KEY": "${input:qdrantApiKey}",
-        "COLLECTION_NAME": "${input:collectionName}"
-      }
-    }
-  }
+  "must_not": [
+    { "field": "is_hidden", "op": "==", "value": true }
+  ]
 }
 ```
 
-## Contributing
+Operators:
 
-If you have suggestions for how mcp-server-qdrant could be improved, or want to report a bug, open an issue!
-We'd love all and any contributions.
+- `==`
+- `!=`
+- `>`
+- `>=`
+- `<`
+- `<=`
+- `any`
+- `except`
 
-### Testing `mcp-server-qdrant` locally
+Field names are automatically prefixed with `metadata.` unless they already
+contain a dot. ISO date strings are compiled to Qdrant datetime ranges for
+range operators.
 
-The [MCP inspector](https://github.com/modelcontextprotocol/inspector) is a developer tool for testing and debugging MCP
-servers. It runs both a client UI (default port 5173) and an MCP proxy server (default port 3000). Open the client UI in
-your browser to use the inspector.
+For strict exclusion on array fields, prefer `must_not` with `any`.
 
-```shell
-QDRANT_URL=":memory:" COLLECTION_NAME="test" \
-fastmcp dev src/mcp_server_qdrant/server.py
+## Embedding models
+
+The only implemented embedding provider type is FastEmbed.
+
+Default model:
+
+```text
+sentence-transformers/all-MiniLM-L6-v2
 ```
 
-Once started, open your browser to http://localhost:5173 to access the inspector interface.
+Supplemental model entries added by this project:
+
+| Model | Dimensions | Notes |
+| --- | ---: | --- |
+| `Qwen/Qwen3-Embedding-0.6B` | 1024 | lightweight Qwen3 embedding model |
+| `Qwen/Qwen3-Embedding-8B` | 4096 | larger multilingual/code retrieval model |
+
+The server also lists models reported by `fastembed.TextEmbedding`.
+
+Important: collection vector dimensions must match the model used to store and
+search data. Create a new collection when switching to a model with a different
+dimension.
+
+## Configuration
+
+Core environment variables:
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `QDRANT_URL` | unset | External Qdrant URL |
+| `QDRANT_API_KEY` | unset | Qdrant API key |
+| `QDRANT_LOCAL_PATH` | unset | Local Qdrant client storage path |
+| `COLLECTION_NAME` | unset | Optional default collection |
+| `EMBEDDING_PROVIDER` | `fastembed` | Embedding provider type |
+| `EMBEDDING_MODEL` | `sentence-transformers/all-MiniLM-L6-v2` | Active dense embedding model |
+| `QDRANT_SEARCH_LIMIT` | `50` | Default limit for raw find |
+| `QDRANT_READ_ONLY` | `false` | Hide mutation tools when true |
+| `QDRANT_ALLOW_ARBITRARY_FILTER` | `false` | Allow raw Qdrant filters on legacy find |
+| `QDRANT_ENABLE_COLLECTION_MANAGEMENT` | `true` | Register collection tools |
+| `QDRANT_ENABLE_DYNAMIC_EMBEDDING_MODELS` | `true` | Register embedding model tools |
+| `QDRANT_ENABLE_RESOURCES` | `true` | Register MCP resources |
+| `QDRANT_DEFAULT_VECTOR_SIZE` | `384` | Default vector-size setting |
+| `QDRANT_DEFAULT_DISTANCE_METRIC` | `cosine` | Default distance metric setting |
+| `QDRANT_MAX_BATCH_SIZE` | `10000` | Configured batch-size ceiling |
+| `QDRANT_MCP_TOOL_PROFILE` | `canonical` | Tool exposure profile |
+
+HTTP transport variables:
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `MCP_TRANSPORT` | `stdio` | `stdio`, `sse`, `streamable-http`, or `http` |
+| `MCP_HOST` | `127.0.0.1` | HTTP bind host |
+| `MCP_PORT` | `8000` | HTTP bind port |
+| `FASTMCP_PORT` | `8000` fallback | Alternate port variable |
+| `MCP_HTTP_AUTH_TOKEN` | unset | Optional bearer token |
+| `MCP_HTTP_ALLOWED_ORIGINS` | unset | Allowed HTTP origins |
+
+## MCP resources
+
+When resources are enabled:
+
+- `qdrant://collections`: markdown overview of all collections.
+- `qdrant://collection/{collection_name}/schema`: markdown schema/statistics
+  for one collection.
+
+## Development notes
+
+Useful commands:
+
+```bash
+uv sync
+uv run pytest
+uv run ruff check .
+uv run mcp-server-qdrant --transport stdio
+uv run mcp-server-qdrant-webui --host 127.0.0.1 --port 8765 --reload
+```
+
+Main code areas:
+
+| Path | Purpose |
+| --- | --- |
+| `src/mcp_server_qdrant/main.py` | MCP CLI transport entry point |
+| `src/mcp_server_qdrant/server.py` | server construction |
+| `src/mcp_server_qdrant/mcp_server.py` | MCP tool registration |
+| `src/mcp_server_qdrant/qdrant.py` | async Qdrant connector |
+| `src/mcp_server_qdrant/embedding_manager.py` | FastEmbed model registry |
+| `src/mcp_server_qdrant/embeddings/` | dense and sparse embedding providers |
+| `src/mcp_server_qdrant/ingest/` | extraction, metadata, document IDs |
+| `src/mcp_server_qdrant/search/` | grouped search, filter grammar, reranking |
+| `src/mcp_server_qdrant/mcp_runtime/` | profiles, envelopes, HTTP security |
+| `src/mcp_server_qdrant/webui/` | FastAPI app |
+| `tests/` | pytest suite |
+
+## Known limitations
+
+- Current checkout startup is blocked by the incomplete discovery-tools wiring
+  noted above.
+- OCR is not implemented. Image-only PDFs produce empty extraction results.
+- `.docx` table and embedded-image extraction is limited.
+- Only FastEmbed is implemented as an embedding provider.
+- `set_collection_embedding_model` changes the active server-side provider; it
+  does not persist per-collection model state.
+- The CLI Docker helper currently attempts to manage a local Qdrant container
+  on startup.
+- Some older docs in the repository describe historical configuration modes
+  that do not map cleanly to the current settings code.
 
 ## License
 
-This MCP server is licensed under the Apache License 2.0. This means you are free to use, modify, and distribute the
-software, subject to the terms and conditions of the Apache License 2.0. For more details, please see the LICENSE file
-in the project repository.
-
-## 🤖 How Automatic Model Selection Works
-
-The server features **intelligent automatic model selection**:
-
-1. **First Use**: When you first store data in a collection, the server uses a default embedding model
-2. **Model Recording**: The server automatically records which model was used for that collection
-3. **Consistency**: All future operations on that collection use the same exact model
-4. **Per-Collection**: Each collection can use a different model based on its specific needs
-5. **Distance Tracking**: Each collection also remembers its distance metric (cosine, dot, euclidean, manhattan)
-6. **No Configuration**: No need to manually specify embedding models in your config
-
-This ensures **perfect consistency** - each collection always uses the same embedding model it was created with, preventing dimension mismatches and maintaining semantic coherence.
-
-### Auto-Managed Docker Features
-
-When using `QDRANT_MODE=docker` with `QDRANT_AUTO_DOCKER=true`:
-
-- 🔍 **Smart Container Detection** - Checks if Qdrant container already exists
-- 🔄 **Port Conflict Resolution** - Automatically finds available ports
-- 💾 **Data Persistence** - Mounts `./qdrant_data` for persistent storage
-- 🧹 **Graceful Cleanup** - Stops container when server exits
-- ⚡ **Health Checking** - Waits for Qdrant API to be ready before proceeding
+Apache-2.0. See `LICENSE`.

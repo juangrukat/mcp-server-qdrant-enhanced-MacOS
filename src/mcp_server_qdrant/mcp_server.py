@@ -253,6 +253,8 @@ class QdrantMCPServer(FastMCP):
         if not self.qdrant_settings.read_only:
             self.setup_ingest_tools()
 
+        self.setup_discovery_tools()
+
     def setup_collection_management_tools(self):
         """Setup enhanced collection management tools."""
 
@@ -911,6 +913,84 @@ class QdrantMCPServer(FastMCP):
                     },
                     profile=profile,
                 )
+
+    def setup_discovery_tools(self) -> None:
+        """Register read-only self-description tools so agents can inspect the server."""
+        from mcp_server_qdrant.mcp_runtime.discovery import (
+            indexed_fields_payload,
+            search_modes_payload,
+            server_capabilities_payload,
+            supported_extractors_payload,
+        )
+        from mcp_server_qdrant.mcp_runtime.envelope import envelope_context, success_from, failure_from
+
+        @self._profile_tool(description="List all indexed payload fields with types, allowed operators, and the supported filter grammar.")
+        async def get_indexed_fields(ctx: Context) -> dict:
+            """Return filterable field schema and the high-level filter grammar."""
+            profile = self.active_profile.name.lower()
+            with envelope_context(profile) as acc:
+                return success_from(acc, data=indexed_fields_payload(), profile=profile)
+
+        @self._profile_tool(description="List supported file extensions and the extractor stack used for each.")
+        async def get_supported_extractors(ctx: Context) -> dict:
+            """Return the supported file extractor matrix."""
+            profile = self.active_profile.name.lower()
+            with envelope_context(profile) as acc:
+                return success_from(acc, data=supported_extractors_payload(), profile=profile)
+
+        @self._profile_tool(description="List supported retrieval modes (dense, hybrid, rerank, late_interaction) and when to use each.")
+        async def list_search_modes(ctx: Context) -> dict:
+            """Return the catalog of retrieval modes."""
+            profile = self.active_profile.name.lower()
+            with envelope_context(profile) as acc:
+                return success_from(acc, data=search_modes_payload(), profile=profile)
+
+        @self._profile_tool(description="Detailed schema and configuration for a specific collection (vectors, distance, hybrid status).")
+        async def get_collection_schema(
+            ctx: Context,
+            collection_name: Annotated[str, Field(description="Collection name to inspect")],
+        ) -> dict:
+            """Return per-collection schema."""
+            profile = self.active_profile.name.lower()
+            with envelope_context(profile) as acc:
+                try:
+                    info = await self.qdrant_connector.get_detailed_collection_info(collection_name)
+                    if not info:
+                        return failure_from(acc, code="not_found", message=f"Collection '{collection_name}' does not exist", profile=profile)
+                    return success_from(
+                        acc,
+                        data={
+                            "name": info.name,
+                            "vector_size": info.vector_size,
+                            "distance_metric": info.distance_metric,
+                            "points_count": info.points_count,
+                            "vectors_count": info.vectors_count,
+                            "indexed_vectors_count": info.indexed_vectors_count,
+                            "segments_count": info.segments_count,
+                            "status": info.status,
+                            "optimizer_status": info.optimizer_status,
+                        },
+                        profile=profile,
+                    )
+                except Exception as e:
+                    return failure_from(acc, code="internal_error", message=str(e), profile=profile, retryable=True)
+
+        @self._profile_tool(description="Top-level server self-description: transports, profiles, search modes, extractors, and feature flags.")
+        async def get_server_capabilities(ctx: Context) -> dict:
+            """Return the top-level server capability map."""
+            import os
+            profile = self.active_profile.name.lower()
+            with envelope_context(profile) as acc:
+                models_avail = [m.model_name for m in self.embedding_manager.list_available_models()]
+                payload = server_capabilities_payload(
+                    profile=profile,
+                    transports=["stdio", "sse", "streamable-http"],
+                    dynamic_embedding_models=self.qdrant_settings.enable_dynamic_embedding_models,
+                    resources_enabled=self.qdrant_settings.enable_resources,
+                    auth_enabled=bool(os.getenv("MCP_HTTP_AUTH_TOKEN")),
+                    available_models=models_avail,
+                )
+                return success_from(acc, data=payload, profile=profile)
 
     def setup_resources(self):
         """Setup enhanced MCP resources."""
