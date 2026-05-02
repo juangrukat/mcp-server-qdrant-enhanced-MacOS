@@ -68,6 +68,7 @@ TOOL_PROFILES: dict[str, ToolProfile] = {
     # --- canonical: collection lifecycle + setup ---
     "create_collection": ToolProfile.CANONICAL,
     "create_hybrid_collection": ToolProfile.CANONICAL,
+    "create_late_interaction_collection": ToolProfile.CANONICAL,
     "bootstrap_collection_indexes": ToolProfile.CANONICAL,
     "set_collection_embedding_model": ToolProfile.CANONICAL,
 

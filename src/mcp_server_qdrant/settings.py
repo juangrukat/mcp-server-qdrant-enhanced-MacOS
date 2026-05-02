@@ -2,6 +2,7 @@
 Enhanced configuration settings with removed limits and better defaults.
 """
 
+from pathlib import Path
 from typing import Literal
 
 from pydantic import BaseModel, Field, model_validator
@@ -31,6 +32,8 @@ from mcp_server_qdrant.enhanced_tool_descriptions import (
 )
 
 METADATA_PATH = "metadata"
+DEFAULT_COLLECTION_NAME = "documents"
+DEFAULT_LOCAL_STORAGE_PATH = str(Path(__file__).resolve().parents[2] / "storage")
 
 
 class ToolSettings(BaseSettings):
@@ -121,6 +124,11 @@ class EmbeddingProviderSettings(BaseSettings):
         default="sentence-transformers/all-MiniLM-L6-v2",
         validation_alias="EMBEDDING_MODEL",
     )
+    device: str = Field(
+        default="cpu",
+        validation_alias="EMBEDDING_DEVICE",
+        description="FastEmbed device, e.g. cpu, cuda, or mps when supported by the local runtime.",
+    )
 
 
 class FilterableField(BaseModel):
@@ -154,9 +162,11 @@ class QdrantSettings(BaseSettings):
     location: str | None = Field(default=None, validation_alias="QDRANT_URL")
     api_key: str | None = Field(default=None, validation_alias="QDRANT_API_KEY")
     collection_name: str | None = Field(
-        default=None, validation_alias="COLLECTION_NAME"
+        default=DEFAULT_COLLECTION_NAME, validation_alias="COLLECTION_NAME"
     )
-    local_path: str | None = Field(default=None, validation_alias="QDRANT_LOCAL_PATH")
+    local_path: str | None = Field(
+        default=DEFAULT_LOCAL_STORAGE_PATH, validation_alias="QDRANT_LOCAL_PATH"
+    )
 
     @model_validator(mode="before")
     @classmethod
@@ -225,8 +235,11 @@ class QdrantSettings(BaseSettings):
 
     @model_validator(mode="after")
     def check_local_path_conflict(self) -> "QdrantSettings":
-        if self.local_path:
-            if self.location is not None or self.api_key is not None:
+        if self.local_path and (self.location is not None or self.api_key is not None):
+            local_path_was_explicit = "local_path" in self.model_fields_set
+            if not local_path_was_explicit and self.local_path == DEFAULT_LOCAL_STORAGE_PATH:
+                self.local_path = None
+            else:
                 raise ValueError(
                     "If 'local_path' is set, 'location' and 'api_key' must be None."
                 )

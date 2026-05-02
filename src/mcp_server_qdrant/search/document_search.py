@@ -32,6 +32,7 @@ async def search_documents_grouped(
     query_filter: models.Filter | None = None,
     min_score: float | None = None,
     sparse_provider: Any = None,
+    late_interaction_provider: Any = None,
     reranker: Reranker | None = None,
     embedding_provider: Any = None,
 ) -> list[dict[str, Any]]:
@@ -51,7 +52,15 @@ async def search_documents_grouped(
     """
     overfetch = min(max(limit * _OVERFETCH_MULTIPLIER, limit + chunks_per_document * limit), _MAX_OVERFETCH)
 
-    if sparse_provider is not None:
+    if late_interaction_provider is not None:
+        raw = await connector.search_late_interaction(
+            query=query,
+            collection_name=collection_name,
+            late_interaction_provider=late_interaction_provider,
+            limit=overfetch,
+            query_filter=query_filter,
+        )
+    elif sparse_provider is not None:
         raw = await connector.search_hybrid_rrf(
             query=query,
             collection_name=collection_name,

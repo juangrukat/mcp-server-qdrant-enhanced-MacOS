@@ -1,6 +1,12 @@
+# ruff: noqa: E402
+
 import os
 import sys
 import logging
+
+from mcp_server_qdrant._warnings import filter_upstream_warnings
+
+filter_upstream_warnings()
 
 from mcp_server_qdrant.mcp_server import QdrantMCPServer
 from mcp_server_qdrant.settings import (

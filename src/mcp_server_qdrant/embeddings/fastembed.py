@@ -18,9 +18,10 @@ class FastEmbedProvider(EmbeddingProvider):
     :param model_name: The name of the FastEmbed model to use.
     """
 
-    def __init__(self, model_name: str):
+    def __init__(self, model_name: str, device: str = "cpu"):
         self.model_name = model_name
-        self.embedding_model = TextEmbedding(model_name, device="cpu")
+        self.device = device
+        self.embedding_model = TextEmbedding(model_name, device=device)
 
     async def embed_documents(self, documents: list[str]) -> list[list[float]]:
         """Embed a list of documents into vectors."""

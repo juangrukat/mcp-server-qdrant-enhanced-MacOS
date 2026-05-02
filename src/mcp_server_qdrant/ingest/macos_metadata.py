@@ -3,6 +3,7 @@ macOS file metadata extraction via mdls (Spotlight) and xattr.
 Produces a normalized dict suitable for Qdrant payload storage.
 """
 
+import asyncio
 import os
 import plistlib
 import subprocess
@@ -10,14 +11,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+MAX_METADATA_PROCS = int(os.environ.get("QDRANT_METADATA_MAX_PROCS", "8"))
+_metadata_semaphore: asyncio.Semaphore | None = None
 
-def get_macos_metadata(path: str) -> dict[str, Any]:
-    """
-    Extract macOS file metadata using mdls (Spotlight) with xattr fallback.
-    Returns a normalized dict with stable field names for Qdrant indexing.
-    """
-    p = Path(path).resolve()
-    meta: dict[str, Any] = {
+
+def _base_metadata(p: Path) -> dict[str, Any]:
+    return {
         "path": str(p),
         "filename": p.name,
         "extension": p.suffix.lstrip(".").lower() if p.suffix else "",
@@ -26,11 +25,41 @@ def get_macos_metadata(path: str) -> dict[str, Any]:
         "has_text": False,
     }
 
+
+def get_macos_metadata(path: str) -> dict[str, Any]:
+    """
+    Extract macOS file metadata using mdls (Spotlight) with xattr fallback.
+    Returns a normalized dict with stable field names for Qdrant indexing.
+    """
+    p = Path(path).resolve()
+    meta: dict[str, Any] = _base_metadata(p)
+
     spotlight = _run_mdls(str(p))
     if spotlight:
         meta.update(_normalize_spotlight(spotlight))
 
     tags = _get_finder_tags(str(p))
+    if tags:
+        meta["tags"] = tags
+    elif "tags" not in meta:
+        meta["tags"] = []
+
+    return meta
+
+
+async def get_macos_metadata_async(path: str) -> dict[str, Any]:
+    """
+    Async metadata extraction for MCP handlers. Uses asyncio subprocesses and
+    bounded concurrency to avoid blocking the event loop during folder ingest.
+    """
+    p = Path(path).resolve()
+    meta = _base_metadata(p)
+
+    spotlight = await _run_mdls_async(str(p))
+    if spotlight:
+        meta.update(_normalize_spotlight(spotlight))
+
+    tags = await _get_finder_tags_async(str(p))
     if tags:
         meta["tags"] = tags
     elif "tags" not in meta:
@@ -49,6 +78,37 @@ def _run_mdls(path: str) -> dict[str, Any] | None:
         if result.returncode != 0 or not result.stdout:
             return None
         return plistlib.loads(result.stdout)
+    except Exception:
+        return None
+
+
+def _get_metadata_semaphore() -> asyncio.Semaphore:
+    global _metadata_semaphore
+    if _metadata_semaphore is None:
+        _metadata_semaphore = asyncio.Semaphore(MAX_METADATA_PROCS)
+    return _metadata_semaphore
+
+
+async def _run_command_async(*args: str, timeout: float = 10) -> tuple[bytes, int]:
+    async with _get_metadata_semaphore():
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *args,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, _stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+            return stdout, proc.returncode or 0
+        except Exception:
+            return b"", 1
+
+
+async def _run_mdls_async(path: str) -> dict[str, Any] | None:
+    stdout, returncode = await _run_command_async("mdls", "-plist", "-", path, timeout=10)
+    if returncode != 0 or not stdout:
+        return None
+    try:
+        return plistlib.loads(stdout)
     except Exception:
         return None
 
@@ -128,6 +188,21 @@ def _get_finder_tags(path: str) -> list[str]:
         raw_bytes = bytes.fromhex(hex_str)
         tags_list = plistlib.loads(raw_bytes)
         # Each tag may be "TagName\n6" (name + newline + color number) — strip the color suffix
+        return [t.split("\n")[0] for t in tags_list if isinstance(t, str)]
+    except Exception:
+        return []
+
+
+async def _get_finder_tags_async(path: str) -> list[str]:
+    stdout, returncode = await _run_command_async(
+        "xattr", "-px", "com.apple.metadata:_kMDItemUserTags", path, timeout=5
+    )
+    if returncode != 0 or not stdout:
+        return []
+    try:
+        hex_str = stdout.decode().replace(" ", "").replace("\n", "")
+        raw_bytes = bytes.fromhex(hex_str)
+        tags_list = plistlib.loads(raw_bytes)
         return [t.split("\n")[0] for t in tags_list if isinstance(t, str)]
     except Exception:
         return []

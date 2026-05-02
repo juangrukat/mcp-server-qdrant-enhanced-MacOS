@@ -23,6 +23,12 @@ def is_qdrant_container_running():
 
 def start_qdrant_container():
     """Starts the Qdrant Docker container if it's not already running."""
+    qdrant_mode = os.environ.get("QDRANT_MODE", "embedded").lower()
+    auto_docker = os.environ.get("QDRANT_AUTO_DOCKER", "false").lower() == "true"
+    if qdrant_mode != "docker" or not auto_docker:
+        logger.info("Qdrant Docker auto-start skipped; embedded/local storage is the default.")
+        return
+
     if is_qdrant_container_running():
         logger.info(f"Qdrant container '{QDRANT_CONTAINER_NAME}' is already running.")
         return
@@ -30,17 +36,20 @@ def start_qdrant_container():
     logger.info(f"Starting Qdrant container '{QDRANT_CONTAINER_NAME}'...")
     script_dir = os.path.dirname(os.path.abspath(__file__))
     project_root = os.path.abspath(os.path.join(script_dir, "..", ".."))
-    qdrant_storage_path = os.path.join(project_root, "qdrant_storage")
+    storage_path = os.environ.get(
+        "QDRANT_DOCKER_STORAGE_PATH",
+        os.environ.get("QDRANT_LOCAL_PATH", os.path.join(project_root, "storage")),
+    )
 
-    # Ensure the qdrant_storage directory exists
-    os.makedirs(qdrant_storage_path, exist_ok=True)
+    # Ensure the storage directory exists
+    os.makedirs(storage_path, exist_ok=True)
 
     command = [
         "docker", "run", "-d",
         "--name", QDRANT_CONTAINER_NAME,
         "-p", "6333:6333",
         "-p", "6334:6334",
-        "-v", f"{qdrant_storage_path}:/qdrant/storage:z",
+        "-v", f"{storage_path}:/qdrant/storage:z",
         "qdrant/qdrant"
     ]
 

@@ -6,6 +6,7 @@ Handles automatic port detection and assignment to avoid conflicts.
 import logging
 import socket
 import os
+from pathlib import Path
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -227,8 +228,8 @@ def setup_qdrant_config():
 
     if qdrant_mode == "embedded":
         # Use embedded Qdrant (local file storage)
-        local_path = os.environ.get("QDRANT_LOCAL_PATH", "./qdrant_data")
-        os.environ["QDRANT_URL"] = local_path
+        local_path = os.environ.get("QDRANT_LOCAL_PATH", str(Path.cwd() / "storage"))
+        os.environ["QDRANT_LOCAL_PATH"] = local_path
         os.makedirs(local_path, exist_ok=True)
         print(f"📁 Using embedded Qdrant: {local_path}")
 

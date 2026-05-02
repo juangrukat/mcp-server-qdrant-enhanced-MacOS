@@ -9,7 +9,7 @@ class RetrievalMode(str, Enum):
     - DENSE: single-stage dense vector search with the active embedding model.
     - HYBRID: dense + sparse (BM25) retrieval fused server-side with RRF.
     - RERANK: HYBRID first-stage, then cross-encoder reranking on the top candidates.
-    - LATE_INTERACTION: reserved for ColBERT-style late interaction (future work).
+    - LATE_INTERACTION: ColBERT-style multivector MaxSim retrieval.
     """
 
     DENSE = "dense"

@@ -8,11 +8,11 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Optional
+from typing import Optional
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 from mcp_server_qdrant.embedding_manager import EnhancedEmbeddingModelManager
 from mcp_server_qdrant.qdrant import BatchEntry, QdrantConnector

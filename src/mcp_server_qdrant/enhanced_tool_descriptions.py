@@ -92,8 +92,8 @@ DEFAULT_TOOL_SET_COLLECTION_EMBEDDING_MODEL_IMPL_DESCRIPTION = (
 
 DEFAULT_TOOL_INGEST_FILE_DESCRIPTION = (
     "Ingest a local file into a Qdrant collection. Extracts text and macOS Spotlight metadata automatically. "
-    "Supported formats: .txt, .md, .pdf (pdfminer + pypdf fallback), .docx. "
-    "Usage: ingest_file(file_path='/path/to/file.pdf', collection_name='my_docs'). "
+    "Supported formats include .txt, .md, .json, .jsonl, .csv, .tsv, code/config text files, .pdf, and .docx. "
+    "Usage: ingest_file(file_path='/path/to/file.pdf', collection_name='my_docs'); collection_name defaults to 'documents'. "
     "Optional: extra_metadata (JSON string of additional fields). "
     "macOS metadata (Finder tags, comments, dates, content type) is extracted and stored as filterable payload. "
     "Returns count of chunks stored and extraction stats."
@@ -101,8 +101,8 @@ DEFAULT_TOOL_INGEST_FILE_DESCRIPTION = (
 
 DEFAULT_TOOL_INGEST_FOLDER_DESCRIPTION = (
     "Recursively ingest all supported files in a folder into a Qdrant collection. "
-    "Supported formats: .txt, .md, .pdf, .docx. Hidden files and system directories are skipped by default. "
-    "Usage: ingest_folder(folder_path='/path/to/folder', collection_name='my_docs'). "
+    "Supported formats include plain text, Markdown, JSON/JSONL, CSV/TSV, code/config text files, PDF, and DOCX. Hidden files and system directories are skipped by default. "
+    "Usage: ingest_folder(folder_path='/path/to/folder', collection_name='my_docs'); collection_name defaults to 'documents'. "
     "Optional: recursive (default True), skip_hidden (default True), extra_metadata (JSON string), "
     "embedding_model (per-request override), mode ('dense' | 'hybrid'). "
     "Two-step gating supported: run_mode='report' returns a dry-run plan with file inventory and "
@@ -115,12 +115,13 @@ DEFAULT_TOOL_SEARCH_DOCUMENTS_DESCRIPTION = (
     "Semantic search with file-level grouping and reranking. "
     "Usage: search_documents(query='...', collection_name='my_docs', limit=10, "
     "chunks_per_document=1, filter={'must': [{'field':'extension','op':'==','value':'pdf'}]}, "
-    "mode='dense'|'hybrid'|'rerank'). "
+    "mode='dense'|'hybrid'|'rerank'|'late_interaction'). "
     "Groups chunks by document_id so a single long file does not dominate results, "
     "returning one summary entry per file with its best representative chunk(s). "
     "Filter grammar uses must/should/must_not clauses with ops: ==, !=, >, >=, <, <=, any, except. "
     "mode='hybrid' requires a hybrid collection (see create_hybrid_collection); "
-    "mode='rerank' adds a cross-encoder rerank pass over hybrid candidates."
+    "mode='rerank' adds a cross-encoder rerank pass over hybrid candidates; "
+    "mode='late_interaction' requires create_late_interaction_collection and ColBERT-style ingestion."
 )
 
 DEFAULT_TOOL_BOOTSTRAP_INDEXES_DESCRIPTION = (

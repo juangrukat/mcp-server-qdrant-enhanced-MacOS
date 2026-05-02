@@ -14,7 +14,10 @@ priority below, update the **Status** column and the **Last updated** date.
 
 A macOS-native fork of the Qdrant MCP server. It now does:
 
+- Defaults to collection `documents` when callers omit a collection name
+- Uses project-root `storage/` as the shared default local/Docker storage directory
 - **macOS file ingestion** (.txt, .md, .pdf, .docx) with Spotlight + Finder metadata
+- **Expanded file ingestion** for plain-text-ish formats plus structured `.json`, `.jsonl`, `.csv`, and `.tsv`
 - **Qwen3-Embedding-8B** (4096D) supplemental dense model alongside the FastEmbed lineup
 - **Hybrid retrieval** — dense + sparse (Qdrant/bm25) with server-side RRF fusion
 - **Document-grouped search** with reranker abstraction (NoOp / FastEmbed cross-encoder / Qwen3-Reranker stub)
@@ -126,76 +129,72 @@ All commits include `Co-Authored-By: Claude Sonnet 4.6`.
 | Structured response envelope on priority tools | ✅ done for 6 tools + 5 discovery tools |
 | Discovery tools | ✅ done — 5 tools |
 | README explains the new MCP model | ✅ done |
-| Existing core functionality still works | ✅ verified at module level (imports, registration). Not end-to-end tested under HTTP transport with concurrent clients. |
-| `outputSchema` + `structuredContent` declared per tool | ⚠️ **PARTIAL** — fastmcp 2.8's `@tool()` decorator does not accept `output_schema=`. Tools return typed dicts so JSON serialization is correct, but the MCP-protocol-level `outputSchema` field is not populated. See Priority 1 below. |
-| Test coverage for transport, schema, multi-client | ❌ **MISSING** — see Priority 2. |
+| Existing core functionality still works | ✅ verified with unit, stdio transport, and streamable HTTP concurrent-client tests. |
+| `outputSchema` + `structuredContent` declared per tool | ✅ done for priority tools — FastMCP upgraded to 2.14 and `_profile_tool` attaches schemas from `mcp_runtime/schemas.py` |
+| Test coverage for transport, schema, multi-client | ✅ focused pytest coverage now exists for schemas, profiles, envelope helpers, plan registry, filter grammar, resolver persistence, provider-safe search, late interaction, async metadata, settings, extractors, stdio transport, and concurrent streamable HTTP clients. |
 
 ---
 
 ## 5. Known limitations / blockers
 
-### 5a. `outputSchema` not declared at MCP protocol level
-**Why this matters:** the MCP spec lets tools advertise an `outputSchema` so
-clients can validate the shape of `structuredContent`. We return the right
-shape — fastmcp serializes `dict` returns as `structuredContent` — but the
-`outputSchema` JSON in `tools/list` is not populated. Strict clients won't
-get the contract guarantees the brief specified.
+### 5a. `outputSchema` declared at MCP protocol level ✅ resolved
+FastMCP is upgraded to 2.14.7 and priority tools get native `output_schema`
+metadata through `_profile_tool`. Schemas live in
+`src/mcp_server_qdrant/mcp_runtime/schemas.py`; `tests/test_output_schemas.py`
+verifies representative tools expose schemas.
 
-**What's needed:** either (a) upgrade past fastmcp 2.8 once it gains
-`output_schema=` (watch <https://github.com/jlowin/fastmcp/releases>), or
-(b) post-process registered `FunctionTool` objects to attach an
-`output_schema` to their MCP metadata. Option (b) is a thin wrapper, ~50 LOC.
+### 5b. Test coverage for production blockers ✅ resolved
+Focused pytest coverage now exists for default settings, expanded extractors,
+priority output schemas, profiles, envelope helpers, plan registry, filter
+grammar, provider resolver persistence, async macOS metadata, provider-safe
+connector search, late-interaction retrieval, stdio transport, and concurrent
+streamable HTTP clients. Old manual/debug fork-era scripts were removed from
+the active test tree.
 
-**Workaround for now:** clients can rely on `contract.contract_version=="1.0"`
-and the documented envelope shape. Bumping `contract_version` is the signal
-for any future shape change.
+### 5c. `late_interaction` retrieval mode ✅ implemented
+`late_interaction` now uses FastEmbed `LateInteractionTextEmbedding` with a
+Qdrant multivector field configured for `MAX_SIM`. Use
+`create_late_interaction_collection` or ingest with `mode="late_interaction"`,
+then query with `search_documents(mode="late_interaction")`.
 
-### 5b. No tests
-The `tests/` directory contains 1 file (`test_vector_name_fix.py`) from
-upstream. Nothing covers profiles, envelope, transport, plan registry,
-provider resolver, or filter grammar.
+### 5d. Sparse provider singleton ✅ resolved
+`get_sparse_provider(model_name)` now caches providers by sparse model name
+instead of keeping one global lazy singleton. Default use remains
+`Qdrant/bm25`, but future sparse models no longer require a mutable global
+"current provider".
 
-### 5c. `late_interaction` retrieval mode is reserved but not implemented
-Returns a structured "mode_not_supported" failure today. ColBERT-style late
-interaction is the planned implementation; FastEmbed has a `LateInteractionTextEmbedding`
-class (e.g. `colbert-ir/colbertv2.0`) but it requires per-token storage and
-multi-vector collections — significantly more work than the current dense+sparse path.
+### 5e. `set_collection_embedding_model` storage ✅ resolved
+Collection→model assignments persist to `<storage>/collection_models.json`
+with atomic temp-file replacement, and are loaded into
+`ProviderResolver._collection_models` on server startup.
 
-### 5d. Sparse provider is still a lazy singleton
-`get_sparse_provider()` caches one instance per server. This is OK for
-multi-agent safety because BM25 is stateless from the request's perspective,
-but if we ever swap to a sparse model with mutable state (some SPLADE variants),
-this becomes unsafe. Documented in commit `23d0b0c`.
+### 5e.1. `.docx` table extraction ✅ improved
+`.docx` extraction now uses `python-docx` `iter_inner_content()` so body
+paragraphs and tables are rendered in document order. Table rows/cells are
+included as searchable text, including nested table content inside cells.
 
-### 5e. `set_collection_embedding_model` storage is in-memory
-The collection→model assignment lives in `ProviderResolver._collection_models`
-(a dict). It's lost on server restart. For persistence we'd need to either:
-- Store it in Qdrant's collection metadata (Qdrant supports payload but not
-  arbitrary collection-level metadata; would need a `_meta` collection or
-  similar), or
-- Persist a sidecar JSON file.
+### 5e.2. FlagEmbedding/BGE portability check ✅ optional
+`tests/test_flagembedding_optional.py` uses `pytest.importorskip("FlagEmbedding")`
+and checks `BAAI/bge-base-en-v1.5` returns a 768-dimensional vector when the
+optional dependency is installed. This does not make FlagEmbedding a runtime
+dependency.
 
-Not blocking, but the assignment doesn't survive a process restart today.
+### 5f. `qdrant_find` provider safety ✅ resolved
+`QdrantConnector.search()` now accepts an optional per-request
+`embedding_provider`, and legacy `qdrant_find` resolves its provider via
+`ProviderResolver`. The curated `search_documents` path is still preferred.
 
-### 5f. `qdrant_find` is broken under default settings
-`QdrantConnector.search()` (used by the legacy `qdrant_find` tool) was not
-audited for the per-request provider refactor. It still uses
-`self._embedding_provider` directly. This is fine for the default profile
-because `qdrant_find` is gated to `full` only, but if someone enables `full`
-profile and shares the server, two clients could see each other's provider.
-Low priority because the curated tools (`search_documents`) already replace it.
+### 5g. uv lockfile drift on macOS ✅ mitigated
+README now documents `uv sync --frozen --group dev` and `uv run --locked`.
+GitHub Actions test CI now runs a macOS/Linux matrix with frozen sync and
+locked pytest; publish CI also uses frozen sync / locked build. Dependency
+updates should be deliberate `uv lock` changes.
 
-### 5g. uv lockfile drift on macOS
-`uv sync` regenerates the lockfile and we committed a snapshot. If a
-contributor runs `uv sync` on a different platform (Linux), the lockfile
-will see platform-specific wheels (e.g. CUDA onnxruntime). We currently
-have no CI matrix or guidance on this. Not urgent; flag if PRs start
-producing noisy lockfile diffs.
-
-### 5h. macOS metadata extraction blocks the event loop
-`get_macos_metadata()` shells out to `mdls` + `xattr` synchronously inside
-async tool handlers. For folder ingest of 1000s of files this serializes
-the spawns and adds latency. Should run in a thread pool executor.
+### 5h. macOS metadata extraction blocks the event loop ✅ resolved
+Async tool handlers now call `get_macos_metadata_async()`, which uses
+`asyncio.create_subprocess_exec` plus a bounded semaphore
+(`QDRANT_METADATA_MAX_PROCS`, default 8). The sync function remains available
+for non-async callers.
 
 ---
 
@@ -316,17 +315,10 @@ These live in markdown today. Worth adding sample config files in
 
 **Effort:** quarter session.
 
-### Priority 6 — `late_interaction` retrieval mode 🟢 research / future
-**Why:** reserved in the enum, mentioned in the brief, but real
-implementation is significant work — requires multi-vector collections and
-ColBERT-style scoring.
-
-**Approach:** investigate FastEmbed's `LateInteractionTextEmbedding`. Add
-`create_late_interaction_collection` connector method. Probably a separate
-collection type (third axis of the `vectors_config`).
-
-**Effort:** full session minimum. **Don't start this without concrete user
-demand.**
+### Priority 6 — `late_interaction` retrieval mode ✅ done
+Implemented with Qdrant multivectors, FastEmbed
+`LateInteractionTextEmbedding`, `create_late_interaction_collection`,
+late-interaction ingest, grouped search routing, and focused tests.
 
 ### Priority 7 — evaluation harness 🟢 research / future
 **Why:** retrieval-quality choices are hard to validate without metrics.

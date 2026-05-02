@@ -2,6 +2,8 @@ import pytest
 
 from mcp_server_qdrant.embeddings.types import EmbeddingProviderType
 from mcp_server_qdrant.settings import (
+    DEFAULT_COLLECTION_NAME,
+    DEFAULT_LOCAL_STORAGE_PATH,
     DEFAULT_TOOL_FIND_DESCRIPTION,
     DEFAULT_TOOL_STORE_DESCRIPTION,
     EmbeddingProviderSettings,
@@ -15,7 +17,9 @@ class TestQdrantSettings:
         """Test that required fields raise errors when not provided."""
 
         # Should not raise error because there are no required fields
-        QdrantSettings()
+        settings = QdrantSettings()
+        assert settings.collection_name == DEFAULT_COLLECTION_NAME
+        assert settings.local_path == DEFAULT_LOCAL_STORAGE_PATH
 
     def test_minimal_config(self, monkeypatch):
         """Test loading minimal configuration from environment variables."""
@@ -70,13 +74,16 @@ class TestEmbeddingProviderSettings:
         settings = EmbeddingProviderSettings()
         assert settings.provider_type == EmbeddingProviderType.FASTEMBED
         assert settings.model_name == "sentence-transformers/all-MiniLM-L6-v2"
+        assert settings.device == "cpu"
 
     def test_custom_values(self, monkeypatch):
         """Test loading custom values from environment variables."""
         monkeypatch.setenv("EMBEDDING_MODEL", "custom_model")
+        monkeypatch.setenv("EMBEDDING_DEVICE", "mps")
         settings = EmbeddingProviderSettings()
         assert settings.provider_type == EmbeddingProviderType.FASTEMBED
         assert settings.model_name == "custom_model"
+        assert settings.device == "mps"
 
 
 class TestToolSettings:

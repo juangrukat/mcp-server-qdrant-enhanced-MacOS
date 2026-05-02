@@ -21,11 +21,16 @@ ONNX models for every request.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import os
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Optional
 
 from mcp_server_qdrant.embedding_manager import EnhancedEmbeddingModelManager
 from mcp_server_qdrant.embeddings.base import EmbeddingProvider
+from mcp_server_qdrant.settings import DEFAULT_LOCAL_STORAGE_PATH
 
 logger = logging.getLogger(__name__)
 
@@ -33,7 +38,12 @@ logger = logging.getLogger(__name__)
 class ProviderResolver:
     """Resolve and cache dense embedding providers without mutating shared state."""
 
-    def __init__(self, manager: EnhancedEmbeddingModelManager, default: EmbeddingProvider):
+    def __init__(
+        self,
+        manager: EnhancedEmbeddingModelManager,
+        default: EmbeddingProvider,
+        storage_root: str | os.PathLike[str] | None = None,
+    ):
         self._manager = manager
         self._default = default
         self._cache: dict[str, EmbeddingProvider] = {}
@@ -42,6 +52,10 @@ class ProviderResolver:
         self._lock = asyncio.Lock()
         # Per-collection model assignments (set by set_collection_embedding_model)
         self._collection_models: dict[str, str] = {}
+        self._storage_root = Path(storage_root or DEFAULT_LOCAL_STORAGE_PATH)
+        self._collection_models_path = self._storage_root / "collection_models.json"
+        self._collection_models_file_lock = asyncio.Lock()
+        self._load_collection_models()
 
     @property
     def default_provider(self) -> EmbeddingProvider:
@@ -52,8 +66,42 @@ class ProviderResolver:
         """Record that a collection should use this embedding model by default."""
         self._collection_models[collection_name] = model_name
 
+    async def assign_collection_model_persisted(self, collection_name: str, model_name: str) -> None:
+        """Record and persist a collection→model assignment."""
+        self._collection_models[collection_name] = model_name
+        await self._save_collection_models()
+
     def collection_model(self, collection_name: str) -> str | None:
         return self._collection_models.get(collection_name)
+
+    def _load_collection_models(self) -> None:
+        if not self._collection_models_path.exists():
+            return
+        try:
+            raw = json.loads(self._collection_models_path.read_text(encoding="utf-8"))
+            loaded: dict[str, str] = {}
+            for collection, config in raw.items():
+                if isinstance(config, dict):
+                    model = config.get("embedding_model")
+                else:
+                    model = config
+                if isinstance(collection, str) and isinstance(model, str) and model:
+                    loaded[collection] = model
+            self._collection_models.update(loaded)
+        except Exception as e:
+            logger.warning(f"Could not load collection model assignments from {self._collection_models_path}: {e}")
+
+    async def _save_collection_models(self) -> None:
+        async with self._collection_models_file_lock:
+            self._storage_root.mkdir(parents=True, exist_ok=True)
+            now = datetime.now(timezone.utc).isoformat()
+            payload = {
+                collection: {"embedding_model": model_name, "updated_at": now}
+                for collection, model_name in sorted(self._collection_models.items())
+            }
+            tmp_path = self._collection_models_path.with_suffix(".json.tmp")
+            tmp_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+            tmp_path.replace(self._collection_models_path)
 
     async def resolve(
         self,

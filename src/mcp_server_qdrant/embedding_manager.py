@@ -100,7 +100,10 @@ class EnhancedEmbeddingModelManager:
 
     def create_provider_for_model(self, model_name: str) -> EmbeddingProvider:
         """Create a new embedding provider for the given model name."""
-        settings = EmbeddingProviderSettings(EMBEDDING_MODEL=model_name)
+        settings = EmbeddingProviderSettings(
+            EMBEDDING_MODEL=model_name,
+            EMBEDDING_DEVICE=self.default_settings.device,
+        )
         return create_embedding_provider(settings)
 
     def find_model_by_vector_size(self, vector_size: int) -> Optional[str]:

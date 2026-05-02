@@ -102,3 +102,7 @@ def main() -> None:
         print(f"An unexpected error occurred: {e}", file=sys.stderr)
         stop_qdrant_container()
         sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

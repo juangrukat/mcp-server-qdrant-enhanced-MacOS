@@ -118,6 +118,7 @@ class QdrantConnector:
         collection_name: str | None = None,
         limit: int = 10,
         query_filter: models.Filter | None = None,
+        embedding_provider: EmbeddingProvider | None = None,
     ) -> list[Entry]:
         """
         Modern search using Query API with intelligent fallback to resolve vector name mismatches.
@@ -136,8 +137,9 @@ class QdrantConnector:
         if not collection_exists:
             return []
 
+        provider = embedding_provider or self._embedding_provider
         # Always use client-side embedding for now to ensure consistency in tests
-        return await self._search_client_side(query, collection_name, limit, query_filter)
+        return await self._search_client_side(query, collection_name, limit, query_filter, provider)
 
     async def _search_server_side(
         self,
@@ -165,17 +167,19 @@ class QdrantConnector:
         query: str,
         collection_name: str,
         limit: int,
-        query_filter: models.Filter | None
+        query_filter: models.Filter | None,
+        embedding_provider: EmbeddingProvider | None = None,
     ) -> list[Entry]:
         """Client-side embedding for guaranteed consistency."""
 
         # Embed query using current embedding provider
-        query_vector = await self._embedding_provider.embed_query(query)
+        provider = embedding_provider or self._embedding_provider
+        query_vector = await provider.embed_query(query)
 
         # Use modern Query API with client-side embedding
         search_results_raw = await self._client.query_points(
             collection_name=collection_name,
-            query=(self._embedding_provider.get_vector_name(), query_vector),
+            query=(provider.get_vector_name(), query_vector),
             limit=limit,
             query_filter=query_filter,
             with_payload=True,
@@ -605,6 +609,96 @@ class QdrantConnector:
             logger.error(f"Error creating hybrid collection {collection_name}: {e}")
             return False
 
+    async def create_late_interaction_collection(
+        self,
+        collection_name: str,
+        vector_size: int,
+        vector_name: str,
+        distance: str = "cosine",
+    ) -> bool:
+        """
+        Create a Qdrant multivector collection for ColBERT-style MaxSim retrieval.
+        """
+        try:
+            distance_map = {
+                "cosine": models.Distance.COSINE,
+                "dot": models.Distance.DOT,
+                "euclidean": models.Distance.EUCLID,
+                "manhattan": models.Distance.MANHATTAN,
+            }
+            distance_metric = distance_map.get(distance.lower(), models.Distance.COSINE)
+
+            await self._client.create_collection(
+                collection_name=collection_name,
+                vectors_config={
+                    vector_name: models.VectorParams(
+                        size=vector_size,
+                        distance=distance_metric,
+                        multivector_config=models.MultiVectorConfig(
+                            comparator=models.MultiVectorComparator.MAX_SIM,
+                        ),
+                        hnsw_config=models.HnswConfigDiff(m=0),
+                    ),
+                },
+            )
+
+            if self._field_indexes:
+                for field_name, field_type in self._field_indexes.items():
+                    await self._client.create_payload_index(
+                        collection_name=collection_name,
+                        field_name=field_name,
+                        field_schema=field_type,
+                    )
+            return True
+        except Exception as e:
+            logger.error(f"Error creating late-interaction collection {collection_name}: {e}")
+            return False
+
+    async def batch_store_late_interaction(
+        self,
+        entries: list[BatchEntry],
+        collection_name: str,
+        late_interaction_provider,
+    ) -> int:
+        """Store entries as multivectors for late-interaction retrieval."""
+        try:
+            if not await self._client.collection_exists(collection_name):
+                created = await self.create_late_interaction_collection(
+                    collection_name=collection_name,
+                    vector_size=late_interaction_provider.get_vector_size(),
+                    vector_name=late_interaction_provider.get_vector_name(),
+                )
+                if not created:
+                    return 0
+
+            documents = [e.content for e in entries]
+            vectors = await late_interaction_provider.embed_documents(documents)
+            vector_name = late_interaction_provider.get_vector_name()
+
+            points = []
+            for i, entry in enumerate(entries):
+                if entry.id:
+                    try:
+                        point_id = str(uuid.UUID(entry.id)).replace("-", "")
+                    except ValueError:
+                        point_id = uuid.uuid5(uuid.NAMESPACE_DNS, entry.id).hex
+                else:
+                    point_id = uuid.uuid4().hex
+
+                points.append(
+                    models.PointStruct(
+                        id=point_id,
+                        payload={"document": entry.content, METADATA_PATH: entry.metadata or {}},
+                        vector={vector_name: vectors[i]},
+                    )
+                )
+
+            await self._client.upsert(collection_name=collection_name, points=points, wait=True)
+            return len(entries)
+        except Exception as e:
+            logger.error(f"Error in batch_store_late_interaction: {e}")
+            return 0
+
     async def batch_store_hybrid(
         self,
         entries: list[BatchEntry],
@@ -700,6 +794,34 @@ class QdrantConnector:
             return self._process_scored_results(response.points)
         except Exception as e:
             logger.error(f"Error in search_hybrid_rrf: {e}")
+            return []
+
+    async def search_late_interaction(
+        self,
+        query: str,
+        collection_name: str,
+        late_interaction_provider,
+        *,
+        limit: int = 10,
+        query_filter: models.Filter | None = None,
+    ) -> list[tuple[Entry, float]]:
+        """
+        Search a multivector collection using Qdrant MaxSim late interaction.
+        """
+        try:
+            query_vector = await late_interaction_provider.embed_query(query)
+            response = await self._client.query_points(
+                collection_name=collection_name,
+                query=query_vector,
+                using=late_interaction_provider.get_vector_name(),
+                limit=limit,
+                query_filter=query_filter,
+                with_payload=True,
+                with_vectors=False,
+            )
+            return self._process_scored_results(response.points)
+        except Exception as e:
+            logger.error(f"Error in search_late_interaction: {e}")
             return []
 
     async def ensure_macos_metadata_indexes(self, collection_name: str) -> None:

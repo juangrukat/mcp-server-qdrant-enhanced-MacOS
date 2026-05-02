@@ -32,7 +32,8 @@ At a high level, the server lets an MCP client or HTTP client:
 
 - Create and inspect Qdrant collections.
 - Store individual text entries or batches.
-- Ingest `.txt`, `.md`, `.pdf`, and `.docx` files.
+- Ingest plain-text-ish files, structured `.json`/`.jsonl`/`.csv`/`.tsv`,
+  PDFs, and DOCX files.
 - Capture macOS Spotlight and Finder metadata while ingesting files.
 - Search by semantic similarity.
 - Search by distinct document instead of raw chunks.
@@ -53,17 +54,14 @@ Requirements:
 Install dependencies from the repository root:
 
 ```bash
-uv sync
+uv sync --frozen --group dev
 ```
 
 Run tests:
 
 ```bash
-uv run pytest
+uv run --locked pytest
 ```
-
-Because the current checkout has the pending `setup_discovery_tools()` call,
-server startup is expected to fail until that code path is fixed.
 
 ## Running the MCP server
 
@@ -86,9 +84,11 @@ uv run mcp-server-qdrant --transport streamable-http --host 127.0.0.1 --port 800
 
 `--transport http` is accepted as an alias for `streamable-http`.
 
-The CLI currently calls the Docker helper on startup. That helper starts a
-container named `qdrant_mcp_server` from the `qdrant/qdrant` image and stores
-data in `qdrant_storage` under the project root.
+By default, local Qdrant storage lives in `storage` under the project root.
+Set `QDRANT_LOCAL_PATH` to move it. If `QDRANT_MODE=docker` and
+`QDRANT_AUTO_DOCKER=true`, the Docker helper starts a container named
+`qdrant_mcp_server` from the `qdrant/qdrant` image and mounts that same
+configurable storage location.
 
 ## Claude Desktop example
 
@@ -226,15 +226,17 @@ Arguments:
 - `chunks_per_document`: number of best chunks to include per document.
   Default: `1`.
 - `filter`: optional high-level filter object.
-- `mode`: `dense`, `hybrid`, `rerank`, or reserved `late_interaction`.
+- `mode`: `dense`, `hybrid`, `rerank`, or `late_interaction`.
 - `reranker_model`: optional reranker for `mode="rerank"`.
+- `late_interaction_model`: optional model for `mode="late_interaction"`.
 
 Search modes:
 
 - `dense`: dense vector search with the active FastEmbed model.
 - `hybrid`: dense + sparse BM25 search fused with reciprocal rank fusion.
 - `rerank`: hybrid first stage followed by a cross-encoder reranker.
-- `late_interaction`: reserved for future ColBERT-style retrieval.
+- `late_interaction`: ColBERT-style multivector retrieval using Qdrant MaxSim.
+  Create or ingest into a late-interaction collection first.
 
 ### File ingestion
 
@@ -244,32 +246,69 @@ and stores all chunks in Qdrant.
 Arguments:
 
 - `file_path`: absolute path.
-- `collection_name`: target collection.
+- `collection_name`: target collection; defaults to `documents`.
 - `extra_metadata`: optional JSON string merged into every chunk.
-- `mode`: `dense` or `hybrid`.
+- `mode`: `dense`, `hybrid`, or `late_interaction`.
+- `embedding_model`: optional dense embedding model override.
+- `late_interaction_model`: optional late-interaction model override.
 
 `ingest_folder` recursively ingests supported files from a directory.
 
 Arguments:
 
 - `folder_path`: absolute path.
-- `collection_name`: target collection.
+- `collection_name`: target collection; defaults to `documents`.
 - `recursive`: default `true`.
 - `skip_hidden`: default `true`.
 - `extra_metadata`: optional JSON string merged into every file.
-- `mode`: `dense` or `hybrid`.
+- `mode`: `dense`, `hybrid`, or `late_interaction`.
+- `embedding_model`: optional dense embedding model override.
+- `late_interaction_model`: optional late-interaction model override.
+- `run_mode`: `apply` or `report`.
+- `plan_id`: optional report/apply plan id.
 
 Supported file types:
 
 | Extension | Extractor |
 | --- | --- |
-| `.txt` | direct text read with charset fallback |
-| `.md` | direct text read, YAML/TOML frontmatter stripped |
-| `.pdf` | `pdfminer.six`, with `pypdf` fallback |
-| `.docx` | `python-docx` |
+| `.txt`, `.log`, `.rst`, `.conf`, `.ini`, `.env` | direct text read with charset fallback |
+| `.md`, `.markdown` | direct text read, YAML/TOML frontmatter stripped |
+| `.json`, `.jsonl` | parsed and rendered as searchable path/value text |
+| `.csv`, `.tsv` | parsed and rendered as row/column text |
+| `.yaml`, `.yml`, `.toml`, `.xml`, `.html`, `.htm` | direct text read with charset fallback |
+| common code/script extensions | direct text read with charset fallback |
+| `.pdf` | preflight scan, then `pdfminer.six`, with `pypdf` fallback |
+| `.docx` | `python-docx`, including paragraphs and tables |
 
 Chunking is paragraph-aware with a target size of 1500 characters and 150
 characters of overlap.
+
+### Ingestion bottlenecks
+
+Foreseeable ingestion bottlenecks:
+
+- **PDF extraction:** `pdfminer.six` is CPU-heavy on large or structurally
+  complex PDFs. The server now runs a cheap PDF preflight first, sampling a few
+  pages for embedded text/images before full extraction.
+- **OCR-less scanned PDFs:** OCR is not implemented. If preflight sees image
+  resources but no extractable text in the sampled pages, the file is treated as
+  probably scanned and full PDF text extraction is skipped. Ingest returns an
+  extraction failure saying OCR is needed.
+- **Embedding throughput:** FastEmbed is batched, but dense, hybrid, and
+  late-interaction modes still spend most ingestion time in embedding for large
+  folders. `EMBEDDING_DEVICE` can be set to `cuda` or `mps` when supported by
+  the installed runtime.
+- **Late-interaction storage:** ColBERT-style multivectors store many vectors
+  per chunk, so ingestion is slower and storage use is higher than dense mode.
+- **Chunking quality:** current chunking is paragraph-aware with fixed
+  character overlap. It is predictable and cheap, but code, tables, and
+  structured files may benefit from format-aware chunking later.
+- **macOS metadata:** Spotlight/Finder metadata collection runs in bounded async
+  subprocesses. Raising `QDRANT_METADATA_MAX_PROCS` can increase throughput but
+  may make folder ingest noisier on the machine.
+- **Qdrant writes and indexes:** large folders pay for vector upsert and payload
+  indexes. Running `bootstrap_collection_indexes` before bulk ingest avoids
+  creating metadata indexes late.
 
 ### Collection tools
 
@@ -286,6 +325,11 @@ The vector size is inferred from the model unless `vector_size` is provided.
 - One dense vector slot using the selected FastEmbed model.
 - One sparse vector slot using `Qdrant/bm25` by default.
 
+`create_late_interaction_collection` creates a Qdrant multivector collection
+for ColBERT-style MaxSim retrieval. The default late-interaction model is
+`colbert-ir/colbertv2.0`, and `search_documents(mode="late_interaction")`
+queries the multivector field.
+
 `bootstrap_collection_indexes` creates payload indexes for the standard macOS
 metadata fields.
 
@@ -298,9 +342,8 @@ metadata fields.
 supplemental Qwen3 entries.
 
 `set_collection_embedding_model` switches the active provider for subsequent
-store and search operations. Despite the historical name, the current
-implementation switches the active model on the server instance; it does not
-persist a per-collection model mapping.
+store and search operations for that collection. Assignments are persisted to
+`<storage>/collection_models.json` and reloaded on server startup.
 
 ### Raw tools
 
@@ -314,6 +357,15 @@ The `full` profile exposes raw chunk-level tools:
 
 These are useful for diagnostics and low-level manipulation, but
 `search_documents` and the ingestion tools are the preferred high-level path.
+`qdrant_find` is retained for compatibility and resolves embedding providers
+per request, but new clients should prefer `search_documents`.
+
+## Structured outputs
+
+Priority tools return the versioned `{contract, data, observability}` envelope
+and advertise MCP `outputSchema` metadata in `tools/list`. The schemas are
+defined in `src/mcp_server_qdrant/mcp_runtime/schemas.py` and attached during
+tool registration.
 
 ## Discovery tools
 
@@ -326,7 +378,7 @@ envelope.
 | `get_server_capabilities` | transports, profiles, search modes, extraction formats, feature flags |
 | `get_indexed_fields` | filterable payload fields with types, allowed operators, role, and the high-level filter grammar |
 | `get_supported_extractors` | per-extension extractor stack and chunking strategy |
-| `list_search_modes` | `dense`, `hybrid`, `rerank`, `late_interaction` (reserved) with when-to-use guidance |
+| `list_search_modes` | `dense`, `hybrid`, `rerank`, `late_interaction` with when-to-use guidance |
 | `get_collection_schema` | per-collection vector config, distance metric, point counts, status |
 
 These payloads are static where possible (no per-request work) so calling
@@ -513,7 +565,9 @@ For strict exclusion on array fields, prefer `must_not` with `any`.
 
 ## Embedding models
 
-The only implemented embedding provider type is FastEmbed.
+The only implemented embedding provider type is FastEmbed. The test suite also
+contains an optional FlagEmbedding/BGE smoke test; it skips automatically unless
+`FlagEmbedding` is installed.
 
 Default model:
 
@@ -530,9 +584,29 @@ Supplemental model entries added by this project:
 
 The server also lists models reported by `fastembed.TextEmbedding`.
 
+Optional compatibility smoke:
+
+```bash
+uv pip install FlagEmbedding
+uv run --locked pytest tests/test_flagembedding_optional.py
+```
+
+That test checks `BAAI/bge-base-en-v1.5` through `FlagEmbedding.FlagModel` and
+expects a 768-dimensional vector. It is intentionally not a required provider
+path yet.
+
 Important: collection vector dimensions must match the model used to store and
 search data. Create a new collection when switching to a model with a different
 dimension.
+
+FastEmbed runs on CPU by default. Set `EMBEDDING_DEVICE` to another device
+supported by the installed FastEmbed/ONNX runtime, such as `cuda` or `mps`, to
+use local acceleration when available.
+
+Batch storage paths call FastEmbed with document batches, so embedding
+computation is batched for `batch_store`, `ingest_file`, and `ingest_folder`.
+Repeated high-level metadata filters are compiled through a small in-process
+cache before being sent to Qdrant.
 
 ## Configuration
 
@@ -542,10 +616,11 @@ Core environment variables:
 | --- | --- | --- |
 | `QDRANT_URL` | unset | External Qdrant URL |
 | `QDRANT_API_KEY` | unset | Qdrant API key |
-| `QDRANT_LOCAL_PATH` | unset | Local Qdrant client storage path |
-| `COLLECTION_NAME` | unset | Optional default collection |
+| `QDRANT_LOCAL_PATH` | `<repo>/storage` | Local Qdrant client storage path |
+| `COLLECTION_NAME` | `documents` | Optional default collection |
 | `EMBEDDING_PROVIDER` | `fastembed` | Embedding provider type |
 | `EMBEDDING_MODEL` | `sentence-transformers/all-MiniLM-L6-v2` | Active dense embedding model |
+| `EMBEDDING_DEVICE` | `cpu` | FastEmbed device, e.g. `cpu`, `cuda`, or `mps` when supported |
 | `QDRANT_SEARCH_LIMIT` | `50` | Default limit for raw find |
 | `QDRANT_READ_ONLY` | `false` | Hide mutation tools when true |
 | `QDRANT_ALLOW_ARBITRARY_FILTER` | `false` | Allow raw Qdrant filters on legacy find |
@@ -556,6 +631,7 @@ Core environment variables:
 | `QDRANT_DEFAULT_DISTANCE_METRIC` | `cosine` | Default distance metric setting |
 | `QDRANT_MAX_BATCH_SIZE` | `10000` | Configured batch-size ceiling |
 | `QDRANT_MCP_TOOL_PROFILE` | `canonical` | Tool exposure profile |
+| `QDRANT_METADATA_MAX_PROCS` | `8` | Maximum concurrent macOS metadata subprocesses |
 
 HTTP transport variables:
 
@@ -567,6 +643,70 @@ HTTP transport variables:
 | `FASTMCP_PORT` | `8000` fallback | Alternate port variable |
 | `MCP_HTTP_AUTH_TOKEN` | unset | Optional bearer token |
 | `MCP_HTTP_ALLOWED_ORIGINS` | unset | Allowed HTTP origins |
+
+Development dependency policy:
+
+- Use `uv sync --frozen --group dev` for normal setup.
+- Use `uv run --locked ...` for day-to-day commands when possible.
+- Treat `uv.lock` as committed, cross-platform state; dependency updates
+  should be deliberate and reviewed, preferably from a single canonical
+  environment.
+
+## Perplexity MCP Research Companion
+
+This repository work has used a separate Perplexity MCP server for external
+research. It is not part of `mcp-server-qdrant`; it is an auxiliary MCP tool
+available in this Codex environment. When asking an agent to use Perplexity, be
+explicit about both the **mode** and the **source focus**.
+
+Perplexity modes map to MCP tools like this:
+
+| Human request | Perplexity MCP tool | What it does | When to use |
+| --- | --- | --- | --- |
+| Search | `perplexity_search` or `perplexity_ask` with concise/default mode | One-step lookup plus quick synthesis | Daily questions, quick answers, current facts |
+| Reasoning | `perplexity_reason` or `perplexity_ask` with `mode="copilot"` / reasoning model when available | Uses stronger reasoning over web context | Multi-step debugging, analytical coding/math questions |
+| Deep Research | `perplexity_research` | Agentic research loop over many sources, returns a mini-report | Technical investigations, competitive analysis, literature-review style work |
+| Compute / ASI | `perplexity_compute` | Computer/ASI mode for heavier task execution | Calculation-heavy or workflow-like research tasks |
+
+Source focus is a separate setting. It changes where Perplexity looks, not
+which reasoning mode it uses:
+
+| Focus | MCP value here | What it surfaces | Best use cases |
+| --- | --- | --- | --- |
+| Web | `sources=["web"]` | Broad internet: docs, news, blogs, product pages | General research, current events, product overviews |
+| Academic | `sources=["scholar"]` | Papers, scholarly indexes, arXiv-style sources | Scientific/technical questions and citation-heavy reports |
+| Social | `sources=["social"]` | Reddit, X/Twitter, forums, community discussion | Developer sentiment, community workarounds, “what are people saying?” |
+
+The common mistake is mixing up **mode** and **focus**. For example, asking for
+“research with social sources” means `perplexity_research` plus
+`sources=["social"]`. Asking for “reasoning with social sources” means
+`perplexity_reason` or a reasoning/copilot ask plus `sources=["social"]`.
+
+The current Perplexity MCP schema exposes `web`, `scholar`, and `social` source
+focus values. Perplexity product focus modes such as Video and Writing may exist
+in the Perplexity UI, but they are not part of the MCP source list used here
+unless that MCP server adds them.
+
+Examples:
+
+```text
+Use Perplexity deep research with sources=["scholar"] to compare Qdrant
+multivector late-interaction implementation patterns.
+```
+
+```text
+Use Perplexity reasoning with sources=["social"] to debug why Codex MCP stdio
+transports are closing for this server.
+```
+
+```text
+Use Perplexity search with sources=["web"] for the current FastMCP output_schema
+API and cite official docs.
+```
+
+In this session, “research” means `perplexity_research`. “Reasoning” means
+`perplexity_reason` or `perplexity_ask` configured for a reasoning/copilot mode.
+If the request matters, spell out the exact tool or mode.
 
 ## MCP resources
 
@@ -581,9 +721,9 @@ When resources are enabled:
 Useful commands:
 
 ```bash
-uv sync
-uv run pytest
-uv run ruff check .
+uv sync --frozen --group dev
+uv run --locked pytest
+uv run --locked ruff check src tests
 uv run mcp-server-qdrant --transport stdio
 uv run mcp-server-qdrant-webui --host 127.0.0.1 --port 8765 --reload
 ```
@@ -606,17 +746,14 @@ Main code areas:
 
 ## Known limitations
 
-- Current checkout startup is blocked by the incomplete discovery-tools wiring
-  noted above.
-- OCR is not implemented. Image-only PDFs produce empty extraction results.
-- `.docx` table and embedded-image extraction is limited.
+- OCR is not implemented. Probably scanned/image-only PDFs fail early with an
+  OCR-needed extraction message after lightweight preflight.
+- `.docx` tables are extracted with `python-docx`; embedded images are not.
 - Only FastEmbed is implemented as an embedding provider.
-- `set_collection_embedding_model` changes the active server-side provider; it
-  does not persist per-collection model state.
-- The CLI Docker helper currently attempts to manage a local Qdrant container
-  on startup.
-- Some older docs in the repository describe historical configuration modes
-  that do not map cleanly to the current settings code.
+- Late-interaction retrieval requires a collection created with
+  `create_late_interaction_collection` or chunks ingested with
+  `mode="late_interaction"`; dense/hybrid collections cannot be queried with
+  that mode.
 
 ## License
 

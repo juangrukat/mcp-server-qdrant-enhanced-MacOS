@@ -17,6 +17,8 @@ For strict array exclusion semantics, prefer must_not + ==/any over except.
 
 from __future__ import annotations
 
+import json
+from functools import lru_cache
 from typing import Any
 
 from qdrant_client import models
@@ -77,8 +79,9 @@ def _build_clause(clauses: list[dict]) -> list[models.Condition]:
     return out
 
 
-def compile_filter(spec: dict | None) -> models.Filter | None:
-    """Compile a high-level filter dict into a Qdrant Filter object. Returns None if empty."""
+@lru_cache(maxsize=512)
+def _compile_filter_cached(spec_json: str) -> models.Filter | None:
+    spec = json.loads(spec_json)
     if not spec:
         return None
     must = _build_clause(spec.get("must", []))
@@ -87,3 +90,11 @@ def compile_filter(spec: dict | None) -> models.Filter | None:
     if not (must or should or must_not):
         return None
     return models.Filter(must=must or None, should=should or None, must_not=must_not or None)
+
+
+def compile_filter(spec: dict | None) -> models.Filter | None:
+    """Compile a high-level filter dict into a cached Qdrant Filter object."""
+    if not spec:
+        return None
+    spec_json = json.dumps(spec, sort_keys=True, separators=(",", ":"), default=str)
+    return _compile_filter_cached(spec_json)

@@ -22,7 +22,7 @@ export QDRANT_MODE=local
 python -m mcp_server_qdrant.main --transport sse
 ```
 
-Data will be stored in `./qdrant_local/` directory.
+Data will be stored in the project-root `./storage/` directory by default.
 
 ## 🐳 Option 3: Auto-Managed Docker (Recommended)
 **Best for**: Production-like development, full Qdrant features
@@ -37,7 +37,7 @@ python -m mcp_server_qdrant.main --transport sse
 
 This will:
 - Automatically start a Qdrant container if not running
-- Use `./qdrant_data/` for persistent storage
+- Use `./storage/` for persistent storage
 - Find available ports automatically
 - Stop the container when server exits
 
@@ -57,7 +57,8 @@ python -m mcp_server_qdrant.main --transport sse
 ### Core Configuration
 - `QDRANT_MODE`: `memory`, `local`, `docker-auto`, or unset (for external)
 - `QDRANT_URL`: URL for external Qdrant (e.g., `http://localhost:6333`)
-- `QDRANT_LOCAL_PATH`: Custom path for local storage (auto-set in local mode)
+- `QDRANT_LOCAL_PATH`: Custom path for local storage (defaults to project-root `storage`)
+- `COLLECTION_NAME`: Default collection name (defaults to `documents`)
 
 ### Port Management
 - `FASTMCP_PORT`: Preferred port for MCP server (default: 8000)
@@ -93,7 +94,7 @@ When using `QDRANT_MODE=docker` with `QDRANT_AUTO_DOCKER=true`:
 
 1. **Smart Container Detection**: Checks if Qdrant container already exists
 2. **Port Conflict Resolution**: Automatically finds available ports
-3. **Data Persistence**: Mounts `./qdrant_data` for persistent storage
+3. **Data Persistence**: Mounts `./storage` for persistent storage
 4. **Graceful Cleanup**: Stops container when server exits
 5. **Health Checking**: Waits for Qdrant API to be ready before proceeding
 
@@ -128,8 +129,8 @@ export FASTMCP_PORT=8001  # Use different port
 ### Reset local data
 ```bash
 # For local mode
-rm -rf ./qdrant_local
+rm -rf ./storage
 
 # For docker-auto mode
-rm -rf ./qdrant_data
+rm -rf ./storage
 ```

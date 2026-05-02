@@ -2,9 +2,15 @@
 Enhanced MCP server with improved embedding management and API key security.
 """
 
+# ruff: noqa: E402
+
 import json
 import logging
 from typing import Annotated, Any
+
+from mcp_server_qdrant._warnings import filter_upstream_warnings
+
+filter_upstream_warnings()
 
 from fastmcp import Context, FastMCP
 from pydantic import Field
@@ -14,10 +20,10 @@ from mcp_server_qdrant.common.filters import make_indexes
 from mcp_server_qdrant.common.func_tools import make_partial_function
 from mcp_server_qdrant.common.wrap_filters import wrap_filters
 from mcp_server_qdrant.embedding_manager import EnhancedEmbeddingModelManager
-from mcp_server_qdrant.embeddings.base import EmbeddingProvider
 from mcp_server_qdrant.mcp_runtime.plan_registry import PlanRegistry
 from mcp_server_qdrant.mcp_runtime.profiles import ToolProfile, is_tool_visible
 from mcp_server_qdrant.mcp_runtime.provider_resolver import ProviderResolver
+from mcp_server_qdrant.mcp_runtime.schemas import TOOL_OUTPUT_SCHEMAS
 from mcp_server_qdrant.qdrant import ArbitraryFilter, Entry, QdrantConnector, BatchEntry
 from mcp_server_qdrant.settings import (
     EmbeddingProviderSettings,
@@ -58,13 +64,15 @@ class QdrantMCPServer(FastMCP):
             # Per-request provider resolver: avoids global mutable state when
             # multiple agents share one HTTP MCP server.
             self.provider_resolver = ProviderResolver(
-                self.embedding_manager, self.embedding_provider
+                self.embedding_manager,
+                self.embedding_provider,
+                storage_root=self.qdrant_settings.local_path,
             )
 
-            # Sparse provider is lazily initialized on first hybrid operation.
-            # NOTE: this is still a lazy singleton; sparse providers are stateless
-            # for fastembed BM25 so sharing across requests is safe.
-            self._sparse_provider = None
+            # Sparse providers are cached by model name so future stateful sparse
+            # models do not require one global mutable "current provider".
+            self._sparse_providers = {}
+            self._late_interaction_providers = {}
 
             # Active MCP tool profile (minimal | canonical | full)
             self.active_profile = ToolProfile.parse(qdrant_settings.mcp_tool_profile)
@@ -113,12 +121,24 @@ class QdrantMCPServer(FastMCP):
             make_indexes(self.qdrant_settings.filterable_fields_dict()),
         )
 
-    def get_sparse_provider(self):
-        """Lazily initialize and cache the sparse embedding provider."""
-        if self._sparse_provider is None:
+    def get_sparse_provider(self, model_name: str = "Qdrant/bm25"):
+        """Lazily initialize and cache sparse providers by model name."""
+        provider = self._sparse_providers.get(model_name)
+        if provider is None:
             from mcp_server_qdrant.embeddings.sparse import SparseEmbeddingProvider
-            self._sparse_provider = SparseEmbeddingProvider()
-        return self._sparse_provider
+            provider = SparseEmbeddingProvider(model_name)
+            self._sparse_providers[model_name] = provider
+        return provider
+
+    def get_late_interaction_provider(self, model_name: str = "colbert-ir/colbertv2.0"):
+        """Lazily initialize and cache late-interaction providers by model name."""
+        provider = self._late_interaction_providers.get(model_name)
+        if provider is None:
+            from mcp_server_qdrant.embeddings.late_interaction import LateInteractionEmbeddingProvider
+
+            provider = LateInteractionEmbeddingProvider(model_name)
+            self._late_interaction_providers[model_name] = provider
+        return provider
 
     def _profile_tool(self, *, name: str | None = None, **kwargs):
         """
@@ -138,6 +158,8 @@ class QdrantMCPServer(FastMCP):
             registry_kwargs = dict(kwargs)
             if name is not None:
                 registry_kwargs["name"] = name
+            if "output_schema" not in registry_kwargs and check_name in TOOL_OUTPUT_SCHEMAS:
+                registry_kwargs["output_schema"] = TOOL_OUTPUT_SCHEMAS[check_name]
             return self.tool(**registry_kwargs)(fn)
         return decorator
 
@@ -154,6 +176,12 @@ class QdrantMCPServer(FastMCP):
         """Format an entry for display."""
         entry_metadata = json.dumps(entry.metadata) if entry.metadata else ""
         return f"<entry><content>{entry.content}</content><metadata>{entry_metadata}</metadata></entry>"
+
+    def _resolve_collection_name(self, collection_name: str | None) -> str:
+        resolved = collection_name or self.qdrant_settings.collection_name
+        if not resolved:
+            raise ValueError("No collection_name provided and no default collection is configured.")
+        return resolved
 
     def setup_tools(self) -> None:
         """Register all tools in the server."""
@@ -174,6 +202,7 @@ class QdrantMCPServer(FastMCP):
                     collection_name=collection_name,
                     limit=self.qdrant_settings.search_limit,
                     query_filter=filter_obj,
+                    embedding_provider=await self.provider_resolver.resolve(collection_name=collection_name),
                 )
 
                 if not entries:
@@ -192,12 +221,13 @@ class QdrantMCPServer(FastMCP):
         async def qdrant_store(
             ctx: Context,
             content: Annotated[str, Field(description="Text content to store")],
-            collection_name: Annotated[str, Field(description="Collection to store the information in")],
+            collection_name: Annotated[str | None, Field(description="Collection to store the information in; defaults to configured collection")] = None,
             metadata: Annotated[str | None, Field(description="Optional metadata as JSON string")] = None,
             entry_id: Annotated[str | None, Field(description="Optional custom ID for the entry")] = None,
         ) -> str:
             """Store information in Qdrant with optional metadata."""
             try:
+                collection_name = self._resolve_collection_name(collection_name)
                 await ctx.debug(f"Storing content in collection '{collection_name}'")
 
                 # Parse metadata from JSON string
@@ -388,9 +418,7 @@ class QdrantMCPServer(FastMCP):
                         if not info:
                             return failure_from(acc, code="unknown_embedding_model", message=f"Unknown dense model: '{embedding_model}'.", profile=profile)
                         dense_provider = self.embedding_manager.create_provider_for_model(embedding_model)
-                        from mcp_server_qdrant.embeddings.sparse import SparseEmbeddingProvider
-                        sparse_provider = SparseEmbeddingProvider(sparse_model)
-                        self._sparse_provider = sparse_provider
+                        sparse_provider = self.get_sparse_provider(sparse_model)
 
                         ok = await self.qdrant_connector.create_hybrid_collection(
                             collection_name=collection_name,
@@ -417,6 +445,52 @@ class QdrantMCPServer(FastMCP):
                         )
                     except Exception as e:
                         await ctx.debug(f"Error creating hybrid collection: {e}")
+                        return failure_from(acc, code="internal_error", message=str(e), profile=profile, retryable=True)
+
+            @self._profile_tool(description="Create a collection for late_interaction retrieval using Qdrant multivectors and ColBERT-style MaxSim scoring.")
+            async def create_late_interaction_collection(
+                ctx: Context,
+                collection_name: Annotated[str, Field(description="Name of the late-interaction collection to create")],
+                late_interaction_model: Annotated[str, Field(description="FastEmbed late-interaction model")] = "colbert-ir/colbertv2.0",
+                distance: Annotated[str, Field(description="Distance metric")] = "cosine",
+            ) -> dict:
+                """Create a collection with one multivector slot for MaxSim retrieval."""
+                from mcp_server_qdrant.mcp_runtime.envelope import envelope_context, success_from, failure_from
+
+                profile = self.active_profile.name.lower()
+                with envelope_context(profile) as acc:
+                    try:
+                        late_provider = self.get_late_interaction_provider(late_interaction_model)
+                        ok = await self.qdrant_connector.create_late_interaction_collection(
+                            collection_name=collection_name,
+                            vector_size=late_provider.get_vector_size(),
+                            vector_name=late_provider.get_vector_name(),
+                            distance=distance,
+                        )
+                        if not ok:
+                            return failure_from(
+                                acc,
+                                code="create_failed",
+                                message=f"Failed to create late-interaction collection '{collection_name}'",
+                                profile=profile,
+                                retryable=True,
+                            )
+                        await self.qdrant_connector.ensure_macos_metadata_indexes(collection_name)
+
+                        return success_from(
+                            acc,
+                            data={
+                                "collection_name": collection_name,
+                                "vector_size": late_provider.get_vector_size(),
+                                "distance": distance,
+                                "late_interaction_model": late_interaction_model,
+                                "vector_name": late_provider.get_vector_name(),
+                                "late_interaction": True,
+                            },
+                            profile=profile,
+                        )
+                    except Exception as e:
+                        await ctx.debug(f"Error creating late-interaction collection: {e}")
                         return failure_from(acc, code="internal_error", message=str(e), profile=profile, retryable=True)
 
             @self._profile_tool(description=self.tool_settings.tool_delete_collection_description)
@@ -498,7 +572,7 @@ class QdrantMCPServer(FastMCP):
                 # Per-request resolution: record the assignment without swapping
                 # any process-global mutable state. Subsequent calls that touch
                 # this collection will pick up the assignment via the resolver.
-                self.provider_resolver.assign_collection_model(collection_name, model_name)
+                await self.provider_resolver.assign_collection_model_persisted(collection_name, model_name)
                 acc.warnings.append(
                     "Note: this assigns a model to a collection. It does not mutate global "
                     "server state. Other clients targeting different collections are unaffected."
@@ -549,13 +623,14 @@ class QdrantMCPServer(FastMCP):
         async def search_documents(
             ctx: Context,
             query: Annotated[str, Field(description="Semantic search query")],
-            collection_name: Annotated[str, Field(description="Collection to search")],
+            collection_name: Annotated[str | None, Field(description="Collection to search; defaults to configured collection")] = None,
             limit: Annotated[int, Field(description="Number of distinct documents to return")] = 10,
             chunks_per_document: Annotated[int, Field(description="Best chunks to surface per document")] = 1,
             filter: Annotated[dict | None, Field(description="High-level filter: {must, should, must_not}")] = None,
-            mode: Annotated[str, Field(description="'dense' | 'hybrid' | 'rerank' | 'late_interaction' (reserved)")] = "dense",
+            mode: Annotated[str, Field(description="'dense' | 'hybrid' | 'rerank' | 'late_interaction'")] = "dense",
             reranker_model: Annotated[str | None, Field(description="Reranker for mode='rerank' (default Xenova/ms-marco-MiniLM-L-6-v2)")] = None,
             embedding_model: Annotated[str | None, Field(description="Override the embedding model for this request only (multi-agent safe)")] = None,
+            late_interaction_model: Annotated[str, Field(description="Late-interaction model for mode='late_interaction'")] = "colbert-ir/colbertv2.0",
         ) -> dict:
             """Document-level grouped search — best chunk per file, ranked by document score."""
             from mcp_server_qdrant.mcp_runtime.envelope import envelope_context, success_from, failure_from
@@ -567,18 +642,17 @@ class QdrantMCPServer(FastMCP):
             profile = self.active_profile.name.lower()
             with envelope_context(profile) as acc:
                 try:
+                    collection_name = self._resolve_collection_name(collection_name)
                     rmode = RetrievalMode.parse(mode)
-                    if rmode == RetrievalMode.LATE_INTERACTION:
-                        return failure_from(
-                            acc,
-                            code="mode_not_supported",
-                            message="Mode 'late_interaction' is reserved for future ColBERT-style retrieval.",
-                            profile=profile,
-                        )
 
                     qfilter = compile_filter(filter) if filter else None
                     use_sparse = rmode in (RetrievalMode.HYBRID, RetrievalMode.RERANK)
                     sparse_provider = self.get_sparse_provider() if use_sparse else None
+                    late_interaction_provider = (
+                        self.get_late_interaction_provider(late_interaction_model)
+                        if rmode == RetrievalMode.LATE_INTERACTION
+                        else None
+                    )
 
                     # Per-request provider resolution: explicit > collection > default.
                     request_provider = await self.provider_resolver.resolve(
@@ -586,6 +660,8 @@ class QdrantMCPServer(FastMCP):
                         collection_name=collection_name,
                     )
                     acc.stats["resolved_embedding_model"] = request_provider.get_model_name()
+                    if late_interaction_provider is not None:
+                        acc.stats["late_interaction_model"] = late_interaction_provider.get_model_name()
 
                     reranker = None
                     if rmode == RetrievalMode.RERANK:
@@ -601,6 +677,7 @@ class QdrantMCPServer(FastMCP):
                         chunks_per_document=chunks_per_document,
                         query_filter=qfilter,
                         sparse_provider=sparse_provider,
+                        late_interaction_provider=late_interaction_provider,
                         reranker=reranker,
                         embedding_provider=request_provider,
                     )
@@ -641,7 +718,7 @@ class QdrantMCPServer(FastMCP):
         @self._profile_tool(description=self.tool_settings.tool_bootstrap_indexes_description)
         async def bootstrap_collection_indexes(
             ctx: Context,
-            collection_name: Annotated[str, Field(description="Collection to index")],
+            collection_name: Annotated[str | None, Field(description="Collection to index; defaults to configured collection")] = None,
         ) -> dict:
             """Create all macOS metadata payload indexes on a collection up front."""
             from mcp_server_qdrant.mcp_runtime.envelope import envelope_context, success_from, failure_from
@@ -649,6 +726,7 @@ class QdrantMCPServer(FastMCP):
             profile = self.active_profile.name.lower()
             with envelope_context(profile) as acc:
                 try:
+                    collection_name = self._resolve_collection_name(collection_name)
                     await self.qdrant_connector.ensure_macos_metadata_indexes(collection_name)
                     return success_from(
                         acc,
@@ -732,10 +810,11 @@ class QdrantMCPServer(FastMCP):
             async def qdrant_store_batch(
                 ctx: Context,
                 entries: Annotated[list[dict], Field(description="List of entries to store, each with 'content' and optional 'metadata' and 'id'")],
-                collection_name: Annotated[str, Field(description="Collection to store entries in")]
+                collection_name: Annotated[str | None, Field(description="Collection to store entries in; defaults to configured collection")] = None,
             ) -> str:
                 """Store multiple entries efficiently in a single batch operation."""
                 try:
+                    collection_name = self._resolve_collection_name(collection_name)
                     # Validate and convert entries
                     batch_entries = []
                     for i, entry_dict in enumerate(entries):
@@ -781,20 +860,27 @@ class QdrantMCPServer(FastMCP):
         async def ingest_file(
             ctx: Context,
             file_path: Annotated[str, Field(description="Absolute path to the file to ingest")],
-            collection_name: Annotated[str, Field(description="Collection to store chunks in")],
+            collection_name: Annotated[str | None, Field(description="Collection to store chunks in; defaults to configured collection")] = None,
             extra_metadata: Annotated[str | None, Field(description="Optional extra metadata as JSON string")] = None,
-            mode: Annotated[str, Field(description="'dense' (default) or 'hybrid' (collection must be hybrid)")] = "dense",
+            mode: Annotated[str, Field(description="'dense' (default), 'hybrid', or 'late_interaction'")] = "dense",
             embedding_model: Annotated[str | None, Field(description="Override the embedding model for this request only")] = None,
+            late_interaction_model: Annotated[str, Field(description="Late-interaction model for mode='late_interaction'")] = "colbert-ir/colbertv2.0",
         ) -> dict:
             """Ingest a single file: extract text, collect macOS metadata, chunk and store."""
             from mcp_server_qdrant.mcp_runtime.envelope import envelope_context, success_from, failure_from
             from mcp_server_qdrant.ingest.extractor import extract_text, build_chunks, SUPPORTED_EXTENSIONS
-            from mcp_server_qdrant.ingest.macos_metadata import get_macos_metadata
+            from mcp_server_qdrant.ingest.macos_metadata import get_macos_metadata_async
             from mcp_server_qdrant.ingest.document_id import compute_document_id
             from pathlib import Path
 
             profile = self.active_profile.name.lower()
             with envelope_context(profile) as acc:
+                try:
+                    collection_name = self._resolve_collection_name(collection_name)
+                    if mode not in ("dense", "hybrid", "late_interaction"):
+                        return failure_from(acc, code="invalid_argument", message=f"Unsupported ingest mode '{mode}'. Valid: dense, hybrid, late_interaction.", profile=profile)
+                except ValueError as e:
+                    return failure_from(acc, code="missing_collection_name", message=str(e), profile=profile)
                 path = Path(file_path).resolve()
                 if not path.exists():
                     return failure_from(acc, code="file_not_found", message=f"File not found: {file_path}", profile=profile)
@@ -814,7 +900,7 @@ class QdrantMCPServer(FastMCP):
                         except json.JSONDecodeError:
                             return failure_from(acc, code="invalid_metadata_json", message=f"Invalid extra_metadata JSON: {extra_metadata}", profile=profile)
 
-                    file_meta = get_macos_metadata(str(path))
+                    file_meta = await get_macos_metadata_async(str(path))
                     doc = extract_text(str(path))
                     file_meta["has_text"] = bool(doc.text)
                     file_meta["extractor_used"] = doc.extractor_used
@@ -852,6 +938,11 @@ class QdrantMCPServer(FastMCP):
                             batch_entries, collection_name, self.get_sparse_provider(),
                             embedding_provider=request_provider,
                         )
+                    elif mode == "late_interaction":
+                        late_provider = self.get_late_interaction_provider(late_interaction_model)
+                        stored = await self.qdrant_connector.batch_store_late_interaction(
+                            batch_entries, collection_name, late_provider
+                        )
                     else:
                         stored = await self.qdrant_connector.batch_store(
                             batch_entries, collection_name, embedding_provider=request_provider
@@ -886,12 +977,13 @@ class QdrantMCPServer(FastMCP):
         async def ingest_folder(
             ctx: Context,
             folder_path: Annotated[str, Field(description="Absolute path to the folder to ingest")],
-            collection_name: Annotated[str, Field(description="Collection to store chunks in")],
+            collection_name: Annotated[str | None, Field(description="Collection to store chunks in; defaults to configured collection")] = None,
             recursive: Annotated[bool, Field(description="Recurse into subdirectories")] = True,
             skip_hidden: Annotated[bool, Field(description="Skip hidden files and directories (starting with .)")] = True,
             extra_metadata: Annotated[str | None, Field(description="Optional extra metadata as JSON string applied to all files")] = None,
-            mode: Annotated[str, Field(description="'dense' (default) or 'hybrid' (collection must be hybrid)")] = "dense",
+            mode: Annotated[str, Field(description="'dense' (default), 'hybrid', or 'late_interaction'")] = "dense",
             embedding_model: Annotated[str | None, Field(description="Override the embedding model for this request only")] = None,
+            late_interaction_model: Annotated[str, Field(description="Late-interaction model for mode='late_interaction'")] = "colbert-ir/colbertv2.0",
             run_mode: Annotated[str, Field(description="'apply' (default, ingests) or 'report' (dry-run plan with plan_id)")] = "apply",
             plan_id: Annotated[str | None, Field(description="plan_id from a prior 'report' run; required when run_mode='apply' is intentionally gated")] = None,
         ) -> dict:
@@ -903,13 +995,19 @@ class QdrantMCPServer(FastMCP):
             """
             from mcp_server_qdrant.mcp_runtime.envelope import envelope_context, success_from, failure_from
             from mcp_server_qdrant.ingest.extractor import extract_text, build_chunks, SUPPORTED_EXTENSIONS
-            from mcp_server_qdrant.ingest.macos_metadata import get_macos_metadata
+            from mcp_server_qdrant.ingest.macos_metadata import get_macos_metadata_async
             from mcp_server_qdrant.ingest.document_id import compute_document_id
             from datetime import datetime, timezone
             from pathlib import Path
 
             profile = self.active_profile.name.lower()
             with envelope_context(profile) as acc:
+                try:
+                    collection_name = self._resolve_collection_name(collection_name)
+                    if mode not in ("dense", "hybrid", "late_interaction"):
+                        return failure_from(acc, code="invalid_argument", message=f"Unsupported ingest mode '{mode}'. Valid: dense, hybrid, late_interaction.", profile=profile)
+                except ValueError as e:
+                    return failure_from(acc, code="missing_collection_name", message=str(e), profile=profile)
                 folder = Path(folder_path).resolve()
                 if not folder.exists():
                     return failure_from(acc, code="folder_not_found", message=f"Folder not found: {folder_path}", profile=profile)
@@ -1001,7 +1099,7 @@ class QdrantMCPServer(FastMCP):
 
                 for path in sorted(all_files):
                     try:
-                        file_meta = get_macos_metadata(str(path))
+                        file_meta = await get_macos_metadata_async(str(path))
                         doc = extract_text(str(path))
                         file_meta["has_text"] = bool(doc.text)
                         file_meta["extractor_used"] = doc.extractor_used
@@ -1026,6 +1124,11 @@ class QdrantMCPServer(FastMCP):
                             stored = await self.qdrant_connector.batch_store_hybrid(
                                 batch_entries, collection_name, self.get_sparse_provider(),
                                 embedding_provider=request_provider,
+                            )
+                        elif mode == "late_interaction":
+                            late_provider = self.get_late_interaction_provider(late_interaction_model)
+                            stored = await self.qdrant_connector.batch_store_late_interaction(
+                                batch_entries, collection_name, late_provider
                             )
                         else:
                             stored = await self.qdrant_connector.batch_store(
