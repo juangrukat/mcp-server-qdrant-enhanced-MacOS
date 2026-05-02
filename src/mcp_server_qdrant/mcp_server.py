@@ -208,6 +208,9 @@ class QdrantMCPServer(FastMCP):
 
         self.setup_advanced_search_tools()
 
+        if not self.qdrant_settings.read_only:
+            self.setup_ingest_tools()
+
     def setup_collection_management_tools(self):
         """Setup enhanced collection management tools."""
 
@@ -482,6 +485,163 @@ class QdrantMCPServer(FastMCP):
                 except Exception as e:
                     await ctx.debug(f"Error in batch store: {e}")
                     return f"Error in batch store: {str(e)}"
+
+    def setup_ingest_tools(self):
+        """Setup file ingestion tools with macOS metadata extraction."""
+        from datetime import datetime, timezone
+
+        @self.tool(description=self.tool_settings.tool_ingest_file_description)
+        async def ingest_file(
+            ctx: Context,
+            file_path: Annotated[str, Field(description="Absolute path to the file to ingest")],
+            collection_name: Annotated[str, Field(description="Collection to store chunks in")],
+            extra_metadata: Annotated[str | None, Field(description="Optional extra metadata as JSON string")] = None,
+        ) -> str:
+            """Ingest a single file: extract text, collect macOS metadata, chunk and store."""
+            from mcp_server_qdrant.ingest.extractor import extract_text, build_chunks, SUPPORTED_EXTENSIONS
+            from mcp_server_qdrant.ingest.macos_metadata import get_macos_metadata
+            from mcp_server_qdrant.ingest.document_id import compute_document_id
+            from pathlib import Path
+
+            path = Path(file_path).resolve()
+            if not path.exists():
+                return f"File not found: {file_path}"
+            if path.suffix.lower() not in SUPPORTED_EXTENSIONS:
+                return f"Unsupported file type '{path.suffix}'. Supported: {', '.join(sorted(SUPPORTED_EXTENSIONS))}"
+
+            try:
+                extra = {}
+                if extra_metadata:
+                    try:
+                        extra = json.loads(extra_metadata)
+                    except json.JSONDecodeError:
+                        return f"Invalid extra_metadata JSON: {extra_metadata}"
+
+                file_meta = get_macos_metadata(str(path))
+                doc = extract_text(str(path))
+                file_meta["has_text"] = bool(doc.text)
+                file_meta["extractor_used"] = doc.extractor_used
+                file_meta["char_count"] = doc.char_count
+                if doc.page_count is not None:
+                    file_meta["page_count"] = doc.page_count
+                file_meta["ingested_at"] = datetime.now(timezone.utc).isoformat()
+                file_meta["document_id"] = compute_document_id(str(path))
+                file_meta["parent_path"] = str(path.parent)
+                file_meta.update(extra)
+
+                if doc.error and not doc.text:
+                    return f"Extraction failed for '{path.name}': {doc.error}"
+
+                chunks = build_chunks(doc, file_meta)
+                if not chunks:
+                    return f"No text extracted from '{path.name}'"
+
+                await self.qdrant_connector.ensure_macos_metadata_indexes(collection_name)
+
+                batch_entries = [
+                    BatchEntry(content=chunk.text, metadata=chunk.metadata)
+                    for chunk in chunks
+                ]
+                stored = await self.qdrant_connector.batch_store(batch_entries, collection_name)
+
+                stats = f"{stored} chunk(s) stored"
+                if doc.error:
+                    stats += f" (warning: {doc.error})"
+                return (
+                    f"Ingested '{path.name}': {stats}. "
+                    f"Extractor: {doc.extractor_used}, {doc.char_count:,} chars"
+                    + (f", {doc.page_count} pages" if doc.page_count else "")
+                    + "."
+                )
+            except Exception as e:
+                await ctx.debug(f"Error ingesting file: {e}")
+                return f"Error ingesting '{file_path}': {str(e)}"
+
+        @self.tool(description=self.tool_settings.tool_ingest_folder_description)
+        async def ingest_folder(
+            ctx: Context,
+            folder_path: Annotated[str, Field(description="Absolute path to the folder to ingest")],
+            collection_name: Annotated[str, Field(description="Collection to store chunks in")],
+            recursive: Annotated[bool, Field(description="Recurse into subdirectories")] = True,
+            skip_hidden: Annotated[bool, Field(description="Skip hidden files and directories (starting with .)")] = True,
+            extra_metadata: Annotated[str | None, Field(description="Optional extra metadata as JSON string applied to all files")] = None,
+        ) -> str:
+            """Recursively ingest all supported files in a folder."""
+            from mcp_server_qdrant.ingest.extractor import extract_text, build_chunks, SUPPORTED_EXTENSIONS
+            from mcp_server_qdrant.ingest.macos_metadata import get_macos_metadata
+            from mcp_server_qdrant.ingest.document_id import compute_document_id
+            from datetime import datetime, timezone
+            from pathlib import Path
+
+            folder = Path(folder_path).resolve()
+            if not folder.exists():
+                return f"Folder not found: {folder_path}"
+            if not folder.is_dir():
+                return f"Not a directory: {folder_path}"
+
+            extra = {}
+            if extra_metadata:
+                try:
+                    extra = json.loads(extra_metadata)
+                except json.JSONDecodeError:
+                    return f"Invalid extra_metadata JSON: {extra_metadata}"
+
+            pattern = "**/*" if recursive else "*"
+            all_files = [
+                p for p in folder.glob(pattern)
+                if p.is_file()
+                and p.suffix.lower() in SUPPORTED_EXTENSIONS
+                and (not skip_hidden or not any(part.startswith(".") for part in p.parts))
+            ]
+
+            if not all_files:
+                return f"No supported files found in '{folder_path}'"
+
+            await self.qdrant_connector.ensure_macos_metadata_indexes(collection_name)
+
+            total_chunks = 0
+            total_files = 0
+            errors: list[str] = []
+            ingested_at = datetime.now(timezone.utc).isoformat()
+
+            for path in sorted(all_files):
+                try:
+                    file_meta = get_macos_metadata(str(path))
+                    doc = extract_text(str(path))
+                    file_meta["has_text"] = bool(doc.text)
+                    file_meta["extractor_used"] = doc.extractor_used
+                    file_meta["char_count"] = doc.char_count
+                    if doc.page_count is not None:
+                        file_meta["page_count"] = doc.page_count
+                    file_meta["ingested_at"] = ingested_at
+                    file_meta["document_id"] = compute_document_id(str(path))
+                    file_meta["parent_path"] = str(path.parent)
+                    file_meta.update(extra)
+
+                    if not doc.text:
+                        errors.append(f"{path.name}: no text extracted ({doc.error or 'empty'})")
+                        continue
+
+                    chunks = build_chunks(doc, file_meta)
+                    batch_entries = [
+                        BatchEntry(content=chunk.text, metadata=chunk.metadata)
+                        for chunk in chunks
+                    ]
+                    stored = await self.qdrant_connector.batch_store(batch_entries, collection_name)
+                    total_chunks += stored
+                    total_files += 1
+                except Exception as e:
+                    errors.append(f"{path.name}: {e}")
+
+            summary = (
+                f"Ingested {total_files}/{len(all_files)} files → "
+                f"{total_chunks} chunks stored in '{collection_name}'."
+            )
+            if errors:
+                summary += f" Errors ({len(errors)}): " + "; ".join(errors[:5])
+                if len(errors) > 5:
+                    summary += f" ...and {len(errors) - 5} more."
+            return summary
 
     def setup_resources(self):
         """Setup enhanced MCP resources."""

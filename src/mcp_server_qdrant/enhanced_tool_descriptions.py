@@ -83,3 +83,21 @@ DEFAULT_TOOL_SET_COLLECTION_EMBEDDING_MODEL_IMPL_DESCRIPTION = (
     "only use this before creating a new collection or with a fresh collection. "
     "Use list_embedding_models to see available models and their dimensions."
 )
+
+DEFAULT_TOOL_INGEST_FILE_DESCRIPTION = (
+    "Ingest a local file into a Qdrant collection. Extracts text and macOS Spotlight metadata automatically. "
+    "Supported formats: .txt, .md, .pdf (pdfminer + pypdf fallback), .docx. "
+    "Usage: ingest_file(file_path='/path/to/file.pdf', collection_name='my_docs'). "
+    "Optional: extra_metadata (JSON string of additional fields). "
+    "macOS metadata (Finder tags, comments, dates, content type) is extracted and stored as filterable payload. "
+    "Returns count of chunks stored and extraction stats."
+)
+
+DEFAULT_TOOL_INGEST_FOLDER_DESCRIPTION = (
+    "Recursively ingest all supported files in a folder into a Qdrant collection. "
+    "Supported formats: .txt, .md, .pdf, .docx. Hidden files and system directories are skipped by default. "
+    "Usage: ingest_folder(folder_path='/path/to/folder', collection_name='my_docs'). "
+    "Optional: recursive (default True), skip_hidden (default True), extra_metadata (JSON string). "
+    "Each file gets macOS Spotlight metadata extracted and stored as filterable payload. "
+    "Returns summary of files processed and total chunks stored."
+)

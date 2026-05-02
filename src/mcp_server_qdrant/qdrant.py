@@ -553,3 +553,30 @@ class QdrantConnector:
             )
             results.append((entry, point.score))
         return results
+
+    async def ensure_macos_metadata_indexes(self, collection_name: str) -> None:
+        """
+        Idempotently create payload indexes for standard macOS file metadata fields.
+        Safe to call on existing collections — Qdrant ignores duplicate index requests.
+        """
+        from mcp_server_qdrant.ingest.macos_metadata import MACOS_INDEX_FIELDS
+
+        type_map = {
+            "keyword": models.PayloadSchemaType.KEYWORD,
+            "integer": models.PayloadSchemaType.INTEGER,
+            "float": models.PayloadSchemaType.FLOAT,
+            "bool": models.PayloadSchemaType.BOOL,
+        }
+
+        for field_path, field_type in MACOS_INDEX_FIELDS:
+            schema = type_map.get(field_type)
+            if schema is None:
+                continue
+            try:
+                await self._client.create_payload_index(
+                    collection_name=collection_name,
+                    field_name=field_path,
+                    field_schema=schema,
+                )
+            except Exception as e:
+                logger.debug(f"Index already exists or error for {field_path}: {e}")
