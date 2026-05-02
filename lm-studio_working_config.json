@@ -4,17 +4,20 @@
       "command": "uv",
       "args": [
         "--directory",
-        "/home/ty/Repositories/mcp-server-qdrant/src",
+        "/Users/YOUR_USERNAME/path/to/mcp-server-qdrant-enhanced-MacOS",
         "run",
         "mcp-server-qdrant",
         "--transport",
         "stdio"
       ],
       "env": {
-        "QDRANT_MODE": "embedded",
-        "QDRANT_COLLECTION_NAME": "lm_studio_memories",
+        "QDRANT_LOCAL_PATH": "/Users/YOUR_USERNAME/qdrant-data",
+        "EMBEDDING_PROVIDER": "fastembed",
+        "EMBEDDING_MODEL": "sentence-transformers/all-MiniLM-L6-v2",
+        "COLLECTION_NAME": "lm_studio_memories",
         "QDRANT_ENABLE_COLLECTION_MANAGEMENT": "true",
-        "QDRANT_ENABLE_RESOURCES": "true"
+        "QDRANT_ENABLE_RESOURCES": "true",
+        "QDRANT_DEFAULT_VECTOR_SIZE": "384"
       }
     }
   }

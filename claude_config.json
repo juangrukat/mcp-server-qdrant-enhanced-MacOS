@@ -4,17 +4,40 @@
       "command": "uv",
       "args": [
         "--directory",
-        "/home/ty/Repositories/mcp-server-qdrant/src",
+        "/Users/YOUR_USERNAME/path/to/mcp-server-qdrant-enhanced-MacOS",
         "run",
         "mcp-server-qdrant"
       ],
       "env": {
-        "QDRANT_MODE": "docker",
-        "QDRANT_AUTO_DOCKER": "true",
-        "QDRANT_API_KEY": "",
+        "QDRANT_URL": "http://localhost:6333",
+        "EMBEDDING_PROVIDER": "fastembed",
+        "EMBEDDING_MODEL": "sentence-transformers/all-MiniLM-L6-v2",
         "QDRANT_ENABLE_COLLECTION_MANAGEMENT": "true",
         "QDRANT_ENABLE_DYNAMIC_EMBEDDING_MODELS": "true",
-        "QDRANT_ENABLE_RESOURCES": "true"
+        "QDRANT_ENABLE_RESOURCES": "true",
+        "QDRANT_DEFAULT_VECTOR_SIZE": "384",
+        "QDRANT_DEFAULT_DISTANCE_METRIC": "cosine",
+        "QDRANT_MAX_BATCH_SIZE": "10000"
+      }
+    },
+    "mcp-server-qdrant-enhanced-qwen": {
+      "command": "uv",
+      "args": [
+        "--directory",
+        "/Users/YOUR_USERNAME/path/to/mcp-server-qdrant-enhanced-MacOS",
+        "run",
+        "mcp-server-qdrant"
+      ],
+      "env": {
+        "QDRANT_URL": "http://localhost:6333",
+        "EMBEDDING_PROVIDER": "fastembed",
+        "EMBEDDING_MODEL": "Qwen/Qwen3-Embedding-8B",
+        "QDRANT_ENABLE_COLLECTION_MANAGEMENT": "true",
+        "QDRANT_ENABLE_DYNAMIC_EMBEDDING_MODELS": "true",
+        "QDRANT_ENABLE_RESOURCES": "true",
+        "QDRANT_DEFAULT_VECTOR_SIZE": "4096",
+        "QDRANT_DEFAULT_DISTANCE_METRIC": "cosine",
+        "QDRANT_MAX_BATCH_SIZE": "100"
       }
     }
   }

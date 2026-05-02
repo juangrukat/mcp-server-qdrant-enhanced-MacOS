@@ -1,21 +1,26 @@
-# mcp-server-qdrant-enhanced: A Qdrant MCP Server
+# mcp-server-qdrant-enhanced-MacOS: A Qdrant MCP Server with macOS-native ingestion
 
 ![alt text](image.png)
 
 ## Overview
 
 A Model Context Protocol server for storing and retrieving semantic memories using the Qdrant vector search engine.
-It provides intelligent semantic memory with automatic embedding model management and multiple deployment modes.
+This fork adds **macOS-native file ingestion** (Spotlight metadata + Finder tags), **Qwen3 large-dimension embeddings**, **document-level grouped search**, and a **REST API for web UI integration**.
 
 ## ✨ Key Features
 
-- 🤖 **Automatic Model Selection** - No manual embedding model configuration needed
-- 🔄 **Per-Collection Model Memory** - Each collection remembers its embedding model
-- 🐳 **Multiple Deployment Modes** - Memory, local file, auto-managed Docker, or external
-- 📊 **Advanced Search** - Hybrid search with similarity scores and filtering
-- 🛠️ **Collection Management** - Create, configure, and manage collections
-- 🎯 **Distance Metric Support** - Cosine, dot product, Euclidean, and Manhattan
-- 📈 **Batch Operations** - Efficient bulk storage and retrieval
+- 📂 **macOS file ingestion** — `ingest_file` and `ingest_folder` tools that extract text from .txt/.md/.pdf/.docx and capture macOS Spotlight metadata (Finder tags, comments, dates, content type, authors)
+- 🧠 **Qwen3-Embedding-8B** — 4096-dimension embeddings supported alongside the standard FastEmbed model lineup
+- 🔎 **Document-level grouped search** — `search_documents` reranks chunk hits at the file level so single PDFs don't dominate results
+- 🎛️ **Filter grammar** — express filters as `must`/`should`/`must_not` instead of raw Qdrant JSON
+- 🌐 **REST API** — built-in FastAPI server (`mcp-server-qdrant-webui`) wraps every operation for easy web UI integration
+- 🤖 **Automatic Model Selection** — No manual embedding model configuration needed
+- 🔄 **Per-Collection Model Memory** — Each collection remembers its embedding model
+- 🐳 **Multiple Deployment Modes** — Memory, local file, auto-managed Docker, or external
+- 📊 **Advanced Search** — Hybrid search with similarity scores and filtering
+- 🛠️ **Collection Management** — Create, configure, and manage collections
+- 🎯 **Distance Metric Support** — Cosine, dot product, Euclidean, and Manhattan
+- 📈 **Batch Operations** — Efficient bulk storage and retrieval
 
 ## Components
 
@@ -67,6 +72,30 @@ It provides intelligent semantic memory with automatic embedding model managemen
     - `entries` (list): List of entries with content, metadata, and optional IDs
     - `collection_name` (string): Target collection
 
+#### macOS File Ingestion
+12. **`ingest_file`** - Ingest a single file with text extraction + macOS Spotlight metadata
+    - `file_path` (string): Absolute path to the file (.txt, .md, .pdf, .docx)
+    - `collection_name` (string): Target collection
+    - `extra_metadata` (JSON, optional): Additional payload fields to merge in
+    - Extractors: pdfminer.six (primary) → pypdf (fallback) for PDFs, python-docx for Word
+    - Captures Finder tags, content type, authors, dates, source URLs, page count
+
+13. **`ingest_folder`** - Recursively ingest all supported files in a folder
+    - `folder_path` (string): Absolute path to the folder
+    - `collection_name` (string): Target collection
+    - `recursive` (bool, default true): Walk subdirectories
+    - `skip_hidden` (bool, default true): Skip dotfiles and hidden directories
+    - `extra_metadata` (JSON, optional): Applied to every ingested file
+
+#### Document-Level Search
+14. **`search_documents`** - Semantic search with file-level grouping and reranking
+    - `query` (string): Search query
+    - `collection_name` (string): Collection to search
+    - `limit` (int, default 10): Number of distinct documents to return
+    - `chunks_per_document` (int, default 1): Best chunks to surface per document
+    - `filter` (object, optional): High-level filter grammar (`must`/`should`/`must_not`)
+    - Groups chunks by `document_id`, returns the best representative chunk per file with a doc-level score
+
 ### Resources
 
 1. **`qdrant://collections`** - Live overview of all collections with statistics
@@ -93,6 +122,77 @@ The server now supports 12+ embedding models with automatic model management:
 - `BAAI/bge-large-en-v1.5` - Highest quality English
 - `thenlper/gte-large` - Large general embeddings
 - `intfloat/e5-large-v2` - E5 family, highest quality
+- `Qwen/Qwen3-Embedding-0.6B` - Qwen3 0.6B, lightweight multilingual
+
+**Premium Models (4096D):**
+- `Qwen/Qwen3-Embedding-8B` - Qwen3 8B, top-tier semantic recall, multilingual + code
+
+> **Note**: Qwen3 models are surfaced via supplemental registry in `embedding_manager.py` and may not appear in `fastembed.list_supported_models()` depending on your fastembed version. The vector size is supplied via a fallback dict in `embeddings/fastembed.py`.
+
+## 📂 macOS File Ingestion
+
+The `ingest_file` and `ingest_folder` tools extract text and capture macOS-native metadata in one step.
+
+### Extractor stack
+
+| Format | Primary | Fallback |
+|---|---|---|
+| `.txt`, `.md` | UTF-8 direct read with charset fallback (utf-8 → utf-8-sig → latin-1 → cp1252); markdown frontmatter is stripped | — |
+| `.pdf` | pdfminer.six | pypdf |
+| `.docx` | python-docx | — |
+
+### Captured metadata
+
+Each chunk's `metadata` payload includes (when available):
+
+| Field | Type | Source | Indexed |
+|---|---|---|---|
+| `path` | keyword | filesystem | ✅ |
+| `filename` | keyword | filesystem | ✅ |
+| `extension` | keyword | filesystem | ✅ |
+| `size_bytes` | integer | filesystem | ✅ |
+| `is_hidden` | bool | filesystem | ✅ |
+| `content_type` | keyword | `kMDItemContentType` | ✅ |
+| `title` | keyword | `kMDItemTitle` | — |
+| `tags` | keyword[] | `kMDItemUserTags` + xattr | ✅ |
+| `authors` | keyword[] | `kMDItemAuthors` | ✅ |
+| `keywords` | keyword[] | `kMDItemKeywords` | ✅ |
+| `comment` | string | `kMDItemComment` | — |
+| `source_urls` | string[] | `kMDItemWhereFroms` | — |
+| `created_at` | keyword (ISO) | `kMDItemFSCreationDate` | ✅ |
+| `modified_at` | keyword (ISO) | `kMDItemFSContentChangeDate` | ✅ |
+| `last_opened_at` | keyword (ISO) | `kMDItemLastUsedDate` | ✅ |
+| `page_count` | integer | `kMDItemNumberOfPages` | ✅ |
+| `duration_seconds` | float | `kMDItemDurationSeconds` | — |
+| `extractor_used` | keyword | runtime | ✅ |
+| `char_count` | integer | runtime | ✅ |
+| `ingested_at` | keyword (ISO) | runtime | ✅ |
+| `document_id` | keyword | hashed path | ✅ |
+| `chunk_index` | integer | runtime | — |
+| `total_chunks` | integer | runtime | — |
+
+Indexes are created idempotently per collection on first ingest. Use `bootstrap_collection_indexes` to create them up front before bulk ingest.
+
+### Filter grammar
+
+`search_documents` accepts a high-level filter object that compiles to Qdrant `must`/`should`/`must_not` clauses:
+
+```json
+{
+  "must": [
+    { "field": "extension", "op": "==", "value": "pdf" },
+    { "field": "modified_at", "op": ">=", "value": "2026-01-01" }
+  ],
+  "should": [
+    { "field": "tags", "op": "any", "value": ["work", "urgent"] }
+  ],
+  "must_not": [
+    { "field": "is_hidden", "op": "==", "value": true }
+  ]
+}
+```
+
+Supported operators: `==`, `!=`, `>`, `>=`, `<`, `<=`, `any`, `except`. Range ops apply to integers and ISO date strings.
 
 **For advanced features with 13 tools and intelligent model management, use the configuration below.**
 
@@ -100,49 +200,17 @@ The server now supports 12+ embedding models with automatic model management:
 
 ### Installation Options
 
-#### Option 1: Development Setup (Recommended for customization)
-Clone and use the repository directly:
+#### Option 1: Development Setup (Recommended)
+Clone and run from source. The `mcp-server-qdrant` entry point auto-starts a local Qdrant Docker container on first launch.
+
 ```bash
-git clone https://github.com/your-repo/mcp-server-qdrant.git
-cd mcp-server-qdrant
+git clone https://github.com/juangrukat/mcp-server-qdrant-enhanced-MacOS.git
+cd mcp-server-qdrant-enhanced-MacOS
+uv sync
 ```
 
-Use this Claude Desktop config:
-```json
-{
-  "mcpServers": {
-    "mcp-server-qdrant": {
-      "command": "uv",
-      "args": [
-        "--directory",
-        "/home/your-username/path/to/mcp-server-qdrant/src",
-        "run",
-        "mcp-server-qdrant"
-      ],
-      "env": {
-        "QDRANT_MODE": "docker",
-        "QDRANT_AUTO_DOCKER": "true",
-        "QDRANT_API_KEY": "",
-        "QDRANT_ENABLE_COLLECTION_MANAGEMENT": "true",
-        "QDRANT_ENABLE_DYNAMIC_EMBEDDING_MODELS": "true",
-        "QDRANT_ENABLE_RESOURCES": "true"
-      }
-    }
-  }
-}
-```
+Claude Desktop config (`~/Library/Application Support/Claude/claude_desktop_config.json`):
 
-#### Option 2: Global Installation
-Install globally using pipx or uvx:
-```bash
-# Using pipx (recommended)
-pipx install mcp-server-qdrant
-
-# Or using uvx
-uvx install mcp-server-qdrant
-```
-
-Use this Claude Desktop config:
 ```json
 {
   "mcpServers": {
@@ -150,22 +218,81 @@ Use this Claude Desktop config:
       "command": "uv",
       "args": [
         "--directory",
-        "/home/ty/Repositories/mcp-server-qdrant/src",
+        "/Users/YOUR_USERNAME/path/to/mcp-server-qdrant-enhanced-MacOS",
         "run",
         "mcp-server-qdrant"
       ],
       "env": {
-        "QDRANT_MODE": "docker",
-        "QDRANT_AUTO_DOCKER": "true",
-        "QDRANT_API_KEY": "",
+        "QDRANT_URL": "http://localhost:6333",
+        "EMBEDDING_PROVIDER": "fastembed",
+        "EMBEDDING_MODEL": "sentence-transformers/all-MiniLM-L6-v2",
         "QDRANT_ENABLE_COLLECTION_MANAGEMENT": "true",
         "QDRANT_ENABLE_DYNAMIC_EMBEDDING_MODELS": "true",
-        "QDRANT_ENABLE_RESOURCES": "true"
+        "QDRANT_ENABLE_RESOURCES": "true",
+        "QDRANT_DEFAULT_VECTOR_SIZE": "384",
+        "QDRANT_DEFAULT_DISTANCE_METRIC": "cosine"
       }
     }
   }
 }
 ```
+
+#### Option 2: Qwen3-Embedding-8B (4096D, premium semantic recall)
+Replace the `EMBEDDING_MODEL` and `QDRANT_DEFAULT_VECTOR_SIZE` env vars:
+
+```json
+"env": {
+  "QDRANT_URL": "http://localhost:6333",
+  "EMBEDDING_PROVIDER": "fastembed",
+  "EMBEDDING_MODEL": "Qwen/Qwen3-Embedding-8B",
+  "QDRANT_ENABLE_COLLECTION_MANAGEMENT": "true",
+  "QDRANT_ENABLE_DYNAMIC_EMBEDDING_MODELS": "true",
+  "QDRANT_ENABLE_RESOURCES": "true",
+  "QDRANT_DEFAULT_VECTOR_SIZE": "4096",
+  "QDRANT_DEFAULT_DISTANCE_METRIC": "cosine"
+}
+```
+
+Then create a fresh Qwen collection — do NOT reuse a 384D collection (dimension mismatch will reject embeddings):
+
+```text
+create_collection(collection_name="qwen_docs", embedding_model="Qwen/Qwen3-Embedding-8B")
+```
+
+#### Option 3: Embedded (no Docker)
+Use Qdrant in local file mode by setting `QDRANT_LOCAL_PATH` instead of `QDRANT_URL`:
+
+```json
+"env": {
+  "QDRANT_LOCAL_PATH": "/Users/YOUR_USERNAME/qdrant-data",
+  "EMBEDDING_MODEL": "sentence-transformers/all-MiniLM-L6-v2"
+}
+```
+
+### Web UI / REST API
+
+Start the optional REST server to drive the same operations from a browser or external app:
+
+```bash
+uv run mcp-server-qdrant-webui --host 127.0.0.1 --port 8765
+```
+
+Endpoints (full schema at `/docs`):
+
+| Method | Path | Description |
+|---|---|---|
+| GET | `/collections` | List collections |
+| GET | `/collections/{name}` | Collection info |
+| POST | `/collections` | Create collection |
+| DELETE | `/collections/{name}` | Delete collection |
+| POST | `/search` | Hybrid semantic search |
+| POST | `/search_documents` | Document-grouped search |
+| POST | `/store` | Single-entry store |
+| POST | `/store_batch` | Batch store |
+| GET | `/scroll/{name}` | Browse with pagination |
+| POST | `/ingest/file` | Ingest a file path |
+| POST | `/ingest/folder` | Ingest a folder |
+| GET | `/embedding_models` | List models |
 
 ### Deployment Modes
 
