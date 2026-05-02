@@ -12,20 +12,19 @@ non-MCP clients.
 
 This repository is in active development.
 
-Important status for the current checkout:
-
-- The package is a Python project named `mcp-server-qdrant` in
-  `pyproject.toml`.
+- The package is a Python project named `mcp-server-qdrant` in `pyproject.toml`.
 - The main MCP entry point is `mcp-server-qdrant`.
 - The REST API entry point is `mcp-server-qdrant-webui`.
 - The default MCP tool profile is `canonical`.
-- The worktree currently contains a pending discovery-tools integration:
-  `src/mcp_server_qdrant/mcp_runtime/discovery.py` exists and
-  `mcp_server.py` calls `self.setup_discovery_tools()`, but that method is not
-  defined in the current file. As of this checkout, importing the MCP server
-  fails until that integration is completed or the call is removed.
-- This README documents the implemented code paths and flags the known startup
-  issue rather than hiding it.
+- The five discovery tools (`get_indexed_fields`, `get_supported_extractors`,
+  `get_collection_schema`, `list_search_modes`, `get_server_capabilities`) are
+  implemented and registered under the `minimal` profile.
+- Streamable HTTP transport is supported alongside `stdio`, with loopback
+  binding, Origin validation, and optional Bearer token auth.
+- Embedding-provider state is resolved per request rather than mutated globally,
+  so multiple agents can share one HTTP server safely.
+- `delete_collection` and `ingest_folder` support a report/apply gating pattern
+  with a single-use `plan_id` and a 10-minute TTL.
 
 ## What it does
 
@@ -194,6 +193,11 @@ Configured profile mapping:
 | `list_embedding_models` | yes | yes | yes |
 | `get_collection_info` | yes | yes | yes |
 | `list_collections` | yes | yes | yes |
+| `get_server_capabilities` | yes | yes | yes |
+| `get_indexed_fields` | yes | yes | yes |
+| `get_supported_extractors` | yes | yes | yes |
+| `get_collection_schema` | yes | yes | yes |
+| `list_search_modes` | yes | yes | yes |
 | `create_collection` | no | yes | yes |
 | `create_hybrid_collection` | no | yes | yes |
 | `bootstrap_collection_indexes` | no | yes | yes |
@@ -204,10 +208,6 @@ Configured profile mapping:
 | `qdrant_store_batch` | no | no | yes |
 | `scroll_collection` | no | no | yes |
 | `hybrid_search` | no | no | yes |
-
-The profile map also lists discovery tools such as `get_indexed_fields` and
-`get_server_capabilities`, but those are part of the incomplete discovery-tool
-integration in the current checkout.
 
 ## Main MCP tools
 
@@ -314,6 +314,84 @@ The `full` profile exposes raw chunk-level tools:
 
 These are useful for diagnostics and low-level manipulation, but
 `search_documents` and the ingestion tools are the preferred high-level path.
+
+## Discovery tools
+
+Five read-only self-description tools let an agent inspect the server before
+acting. All five live in the `minimal` profile and return the structured
+envelope.
+
+| Tool | Returns |
+| --- | --- |
+| `get_server_capabilities` | transports, profiles, search modes, extraction formats, feature flags |
+| `get_indexed_fields` | filterable payload fields with types, allowed operators, role, and the high-level filter grammar |
+| `get_supported_extractors` | per-extension extractor stack and chunking strategy |
+| `list_search_modes` | `dense`, `hybrid`, `rerank`, `late_interaction` (reserved) with when-to-use guidance |
+| `get_collection_schema` | per-collection vector config, distance metric, point counts, status |
+
+These payloads are static where possible (no per-request work) so calling
+them cheaply is fine.
+
+## Report/apply gating
+
+Mutating or expensive tools support a two-step pattern:
+
+1. Call with `mode="report"` (or `run_mode="report"` for `ingest_folder`) to
+   preview the action. The server returns a `plan_id` with a 10-minute TTL plus
+   a description of what would happen.
+2. Call again with `mode="apply"` and `plan_id=<id>` to execute. The plan_id
+   is single-use, scoped to the originating tool, and validated against the
+   request target before execution.
+
+| Tool | Report payload includes |
+| --- | --- |
+| `delete_collection` | target collection, existence, vector config, point count, destructive warning |
+| `ingest_folder` | candidate file count, extension breakdown, sample paths, warnings |
+
+`bootstrap_collection_indexes` is idempotent and not gated. Direct `apply`
+without first running `report` is allowed for low-risk cases (e.g. running
+`ingest_folder` once you already trust the inputs); strict gating can be
+enforced by your client by requiring a fresh plan_id.
+
+## Multi-agent safety
+
+The server is designed for multiple AI agents sharing one running process
+over Streamable HTTP. The relevant guarantees:
+
+- Embedding providers are resolved per request, not held as a single mutable
+  global. `set_collection_embedding_model` records a per-collection assignment
+  in the resolver and does not affect other clients targeting other collections.
+- Provider instances are cached by `(provider_type, model_name)` so re-using a
+  model across requests is fast, but no cached entry is mutated after creation.
+- The plan registry is process-local, namespaced by tool, with TTL eviction
+  and single-use semantics.
+- HTTP transport binds to `127.0.0.1` by default, validates the `Origin`
+  header against an allowlist, and supports an optional Bearer token via
+  `MCP_HTTP_AUTH_TOKEN`.
+
+If you discover a request path that mutates shared state, please open an
+issue — the auditing intent is that no client can change behavior another
+client observes.
+
+## Recommended workflows
+
+### Safe setup
+1. `get_server_capabilities` — confirm transport and feature set
+2. `list_embedding_models` — pick a dense model
+3. `create_collection` *or* `create_hybrid_collection` for hybrid retrieval
+4. `bootstrap_collection_indexes` — pre-create payload indexes
+5. `ingest_folder` (optionally with `run_mode="report"` first)
+6. `search_documents` to verify the corpus
+
+### Safe search
+1. `get_indexed_fields` — inspect the filter grammar and available fields
+2. `search_documents(mode="dense" | "hybrid" | "rerank", filter=...)`
+3. Refine filters / re-search until satisfied
+
+### Safe mutation
+1. `delete_collection(collection_name="x", mode="report")` → returns plan_id
+2. Inspect the plan payload; confirm the target and warnings
+3. `delete_collection(collection_name="x", mode="apply", plan_id="plan_xyz")`
 
 ## Response envelope
 
