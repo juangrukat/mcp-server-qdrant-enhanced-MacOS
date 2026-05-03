@@ -46,6 +46,8 @@ Use these from the repo root:
 ```bash
 ./scripts/local-install.sh
 ./scripts/local-run-qdrant.sh
+./scripts/local-configure-hermes.py
+./scripts/local-doctor.sh
 ./scripts/local-run-webui.sh
 ./scripts/local-run-mcp.sh
 ```
@@ -82,10 +84,20 @@ QDRANT_MODE=server EMBEDDING_MODEL='Qwen/Qwen3-Embedding-4B' ./scripts/local-run
 
 `local-run-qdrant.sh` needs a reachable Docker daemon.
 
+Hermes should use the direct venv entrypoint, not `uv run`, because Hermes may
+not inherit the same `uv` command environment as an interactive shell:
+
+```bash
+./scripts/local-configure-hermes.py
+hermes mcp test qdrant
+```
+
 Do not run REST and stdio MCP against the same embedded `.local/qdrant-storage`
 path at the same time. Qdrant local mode locks the path by design. Also do not
 mount `.local/qdrant-storage` directly into a Qdrant Docker server; migrate
 collections with `scripts/migrate-local-to-server.py` instead.
+Server-mode MCP treats Qdrant as external and must not stop the Docker
+container when Hermes disconnects.
 
 Launch note: Qdrant server can accept concurrent clients, but local embedding
 and ingestion still need backpressure. REST and MCP now use a bounded in-process

@@ -107,6 +107,8 @@ state out of Git:
 ```bash
 ./scripts/local-install.sh
 ./scripts/local-run-qdrant.sh
+./scripts/local-configure-hermes.py
+./scripts/local-doctor.sh
 ./scripts/local-run-webui.sh
 ./scripts/local-run-mcp.sh
 ```
@@ -147,7 +149,31 @@ official Qdrant server container.
 
 In server mode, REST, MCP, and other local agents all connect to
 `http://127.0.0.1:6333` through `QDRANT_URL`. Do not set
-`QDRANT_LOCAL_PATH` in that mode.
+`QDRANT_LOCAL_PATH` in that mode. Server-mode MCP processes treat Qdrant as an
+external dependency and do not stop the Docker container when an MCP client
+disconnects.
+
+For Hermes, run:
+
+```bash
+./scripts/local-configure-hermes.py
+hermes mcp test qdrant
+```
+
+The Hermes helper intentionally writes the direct virtualenv entrypoint
+`.venv/bin/mcp-server-qdrant` instead of `uv run --locked mcp-server-qdrant`.
+Some long-running launchers do not inherit the same `uv` environment as an
+interactive shell, while the venv entrypoint is stable after
+`./scripts/local-install.sh`.
+
+Use the doctor script when something looks down:
+
+```bash
+./scripts/local-doctor.sh
+```
+
+It checks the MCP binary, Qwen3 sidecar, Docker daemon, Qdrant server readiness,
+and Hermes MCP connection.
 
 Useful local defaults from `scripts/local-env.sh`:
 
@@ -275,14 +301,9 @@ Claude Desktop-style configuration for the recommended shared-server path:
 {
   "mcpServers": {
     "qdrant-enhanced": {
-      "command": "uv",
-      "args": [
-        "--directory",
-        "/path/to/mcp-server-qdrant-enhanced",
-        "run",
-        "--locked",
-        "mcp-server-qdrant"
-      ],
+      "command": "/path/to/mcp-server-qdrant-enhanced/.venv/bin/mcp-server-qdrant",
+      "args": [],
+      "cwd": "/path/to/mcp-server-qdrant-enhanced",
       "env": {
         "QDRANT_MODE": "server",
         "QDRANT_URL": "http://127.0.0.1:6333",
@@ -332,14 +353,9 @@ Example configuration:
 {
   "mcpServers": {
     "qdrant-enhanced": {
-      "command": "uv",
-      "args": [
-        "--directory",
-        "/path/to/mcp-server-qdrant-enhanced",
-        "run",
-        "--locked",
-        "mcp-server-qdrant"
-      ],
+      "command": "/path/to/mcp-server-qdrant-enhanced/.venv/bin/mcp-server-qdrant",
+      "args": [],
+      "cwd": "/path/to/mcp-server-qdrant-enhanced",
       "env": {
         "QDRANT_MODE": "server",
         "QDRANT_URL": "http://127.0.0.1:6333",
@@ -1024,6 +1040,8 @@ uv sync --frozen --group dev
 uv run --locked pytest
 uv run --locked ruff check src tests
 ./scripts/local-run-qdrant.sh
+./scripts/local-configure-hermes.py
+./scripts/local-doctor.sh
 uv run mcp-server-qdrant --transport stdio
 uv run mcp-server-qdrant-webui --host 127.0.0.1 --port 8765 --reload
 ```

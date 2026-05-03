@@ -26,3 +26,12 @@ else
   echo "Qdrant URL:"
   echo "  ${QDRANT_URL}"
 fi
+
+cat <<EOF
+
+Hermes setup:
+  ./scripts/local-configure-hermes.py
+
+Health check:
+  ./scripts/local-doctor.sh
+EOF

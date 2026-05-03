@@ -1,14 +1,9 @@
 {
   "mcpServers": {
     "mcp-server-qdrant-enhanced": {
-      "command": "uv",
-      "args": [
-        "--directory",
-        "/path/to/mcp-server-qdrant-enhanced",
-        "run",
-        "--locked",
-        "mcp-server-qdrant"
-      ],
+      "command": "/path/to/mcp-server-qdrant-enhanced/.venv/bin/mcp-server-qdrant",
+      "cwd": "/path/to/mcp-server-qdrant-enhanced",
+      "args": [],
       "env": {
         "QDRANT_MODE": "server",
         "QDRANT_URL": "http://127.0.0.1:6333",
@@ -23,14 +18,9 @@
       }
     },
     "mcp-server-qdrant-enhanced-qwen": {
-      "command": "uv",
-      "args": [
-        "--directory",
-        "/path/to/mcp-server-qdrant-enhanced",
-        "run",
-        "--locked",
-        "mcp-server-qdrant"
-      ],
+      "command": "/path/to/mcp-server-qdrant-enhanced/.venv/bin/mcp-server-qdrant",
+      "cwd": "/path/to/mcp-server-qdrant-enhanced",
+      "args": [],
       "env": {
         "QDRANT_MODE": "server",
         "QDRANT_URL": "http://127.0.0.1:6333",

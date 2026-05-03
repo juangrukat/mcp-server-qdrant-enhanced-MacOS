@@ -8,6 +8,13 @@ logger = logging.getLogger(__name__)
 
 QDRANT_CONTAINER_NAME = "qdrant_mcp_server"
 
+def should_manage_qdrant_container() -> bool:
+    """Return true only when this process owns Docker container lifecycle."""
+    qdrant_mode = os.environ.get("QDRANT_MODE", "embedded").lower()
+    auto_docker = os.environ.get("QDRANT_AUTO_DOCKER", "false").lower() == "true"
+    return qdrant_mode == "docker" and auto_docker
+
+
 def is_qdrant_container_running():
     """Checks if the Qdrant Docker container is running."""
     try:
@@ -23,10 +30,8 @@ def is_qdrant_container_running():
 
 def start_qdrant_container():
     """Starts the Qdrant Docker container if it's not already running."""
-    qdrant_mode = os.environ.get("QDRANT_MODE", "embedded").lower()
-    auto_docker = os.environ.get("QDRANT_AUTO_DOCKER", "false").lower() == "true"
-    if qdrant_mode != "docker" or not auto_docker:
-        logger.info("Qdrant Docker auto-start skipped; embedded/local storage is the default.")
+    if not should_manage_qdrant_container():
+        logger.info("Qdrant Docker auto-start skipped; this process does not own Docker lifecycle.")
         return
 
     if is_qdrant_container_running():
@@ -99,6 +104,10 @@ def wait_for_qdrant_ready(timeout=60, interval=1):
 
 def stop_qdrant_container():
     """Stops the Qdrant Docker container."""
+    if not should_manage_qdrant_container():
+        logger.info("Qdrant Docker stop skipped; this process does not own Docker lifecycle.")
+        return
+
     if not is_qdrant_container_running():
         logger.info(f"Qdrant container '{QDRANT_CONTAINER_NAME}' is not running.")
         return
