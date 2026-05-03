@@ -23,6 +23,21 @@ export QDRANT_INGEST_CHUNK_SIZE="${QDRANT_INGEST_CHUNK_SIZE:-700}"
 export QDRANT_INGEST_CHUNK_OVERLAP="${QDRANT_INGEST_CHUNK_OVERLAP:-70}"
 export QDRANT_WRITE_MAX_CONCURRENCY="${QDRANT_WRITE_MAX_CONCURRENCY:-1}"
 export QDRANT_WRITE_QUEUE_SIZE="${QDRANT_WRITE_QUEUE_SIZE:-8}"
+# Sparse model for hybrid retrieval. "Qdrant/bm25" (default, no download) or
+# "Qdrant/bm42-all-minilm-l6-v2-attentions" (neural BM25 improvement, ~22 MB download).
+export QDRANT_SPARSE_MODEL="${QDRANT_SPARSE_MODEL:-Qdrant/bm25}"
+# Default reranker for mode="rerank". FastEmbed options need no extra deps;
+# Qwen3 options require: uv pip install 'mcp-server-qdrant[reranking]'
+# Examples: "Xenova/ms-marco-MiniLM-L-6-v2", "BAAI/bge-reranker-base",
+#           "Qwen/Qwen3-Reranker-4B", "Qwen/Qwen3-Reranker-0.6B"
+export QDRANT_RERANKER_MODEL="${QDRANT_RERANKER_MODEL:-Xenova/ms-marco-MiniLM-L-6-v2}"
+# Custom task instruction for Qwen3 rerankers (optional). Improves ranking quality
+# ~1-5% when tailored to your retrieval task. Leave unset for the generic default.
+# export QDRANT_RERANKER_INSTRUCTION="Retrieve passages that directly answer the question using explicit claims, definitions, or evidence from the document."
+# Candidate pool size before grouping/reranking. 0 = auto (100 with reranker, 80 without).
+export QDRANT_RERANK_PREFETCH_LIMIT="${QDRANT_RERANK_PREFETCH_LIMIT:-0}"
+# Max candidates scored by the reranker. 0 = all prefetched.
+export QDRANT_RERANK_TOP_K="${QDRANT_RERANK_TOP_K:-0}"
 export MCP_HOST="${MCP_HOST:-127.0.0.1}"
 export MCP_PORT="${MCP_PORT:-8000}"
 export FASTMCP_PORT="${FASTMCP_PORT:-${MCP_PORT}}"

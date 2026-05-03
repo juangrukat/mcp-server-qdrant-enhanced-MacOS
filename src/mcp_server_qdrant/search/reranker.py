@@ -13,8 +13,12 @@ Qwen3-Reranker, ColBERT late interaction) without touching call sites.
 The default `NoOpReranker` is the safe fallback when reranking is disabled. The
 `FastEmbedReranker` lazy-loads a cross-encoder via fastembed when available.
 
-For Qwen3-Reranker-4B / 8B, see `QwenReranker` (stub — requires a
-torch+transformers backend that is not currently a hard dependency of this project).
+`QwenReranker` implements Qwen3-Reranker-{0.6B,4B,8B} via the transformers
+library (AutoModelForCausalLM). These models score relevance by predicting "yes"
+or "no" at the final token position. Install optional deps first:
+
+    pip install torch transformers accelerate
+    # or: uv pip install 'mcp-server-qdrant[reranking]'
 """
 
 from __future__ import annotations
@@ -137,27 +141,133 @@ class FastEmbedReranker(Reranker):
 
 class QwenReranker(Reranker):
     """
-    Stub for Qwen3-Reranker-{4B,8B}. Requires torch + transformers, which are NOT
-    currently hard dependencies of this project. Install them separately:
+    Qwen3-Reranker-{0.6B,4B,8B} via transformers (AutoModelForCausalLM).
 
-        pip install torch transformers accelerate
+    These are generative rerankers: each (query, doc) pair is formatted with a
+    prompt template and the relevance score is P("yes") from the final token logits.
 
-    Then construct:
+    Requires: pip install torch transformers accelerate
+    Recommended local use: model_name="Qwen/Qwen3-Reranker-4B", device auto-selects MPS.
 
-        QwenReranker(model_name="Qwen/Qwen3-Reranker-4B", device="mps")
-
-    The implementation here is intentionally a clear placeholder so the abstraction
-    is in place; uncomment and complete when you wire up transformers.
+    Custom instruction improves quality by 1-5% when task is known:
+        QwenReranker(instruction="Given a book search query, retrieve relevant passages")
     """
 
-    def __init__(self, model_name: str = "Qwen/Qwen3-Reranker-4B", device: str = "mps"):
+    _SYSTEM_PROMPT = (
+        "<|im_start|>system\nJudge whether the Document meets the requirements "
+        "based on the Query and the Instruct provided. Note that the answer can "
+        "only be \"yes\" or \"no\".<|im_end|>\n<|im_start|>user\n"
+    )
+    _RESPONSE_TEMPLATE = "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+    _DEFAULT_INSTRUCTION = (
+        "Given a web search query, retrieve relevant passages that answer the query"
+    )
+
+    def __init__(
+        self,
+        model_name: str = "Qwen/Qwen3-Reranker-4B",
+        device: str | None = None,
+        max_length: int = 8192,
+        instruction: str | None = None,
+        batch_size: int = 4,
+    ):
         self._model_name = model_name
-        self._device = device
-        self._loaded = False
+        self._device = device  # None → auto-detect at load time
+        self._max_length = max_length
+        self._instruction = instruction or self._DEFAULT_INSTRUCTION
+        self._batch_size = batch_size
+        self._model = None
+        self._tokenizer = None
+        self._token_true_id: int | None = None
+        self._token_false_id: int | None = None
+        self._prefix_tokens: list[int] = []
+        self._suffix_tokens: list[int] = []
 
     @property
     def model_name(self) -> str:
         return self._model_name
+
+    def _load(self) -> None:
+        if self._model is not None:
+            return
+        try:
+            import torch
+            from transformers import AutoModelForCausalLM, AutoTokenizer
+        except ImportError as e:
+            raise RuntimeError(
+                "QwenReranker requires torch and transformers. "
+                "Install with: pip install torch transformers accelerate\n"
+                f"Import error: {e}"
+            ) from e
+
+        device = self._device
+        if device is None:
+            if torch.backends.mps.is_available():
+                device = "mps"
+            elif torch.cuda.is_available():
+                device = "cuda"
+            else:
+                device = "cpu"
+
+        logger.info("Loading %s on %s ...", self._model_name, device)
+        dtype = torch.float32 if device == "cpu" else torch.float16
+
+        tokenizer = AutoTokenizer.from_pretrained(self._model_name, padding_side="left")
+        model = AutoModelForCausalLM.from_pretrained(
+            self._model_name,
+            torch_dtype=dtype,
+        ).to(device).eval()
+
+        self._tokenizer = tokenizer
+        self._model = model
+        self._device = device
+        self._token_true_id = tokenizer.convert_tokens_to_ids("yes")
+        self._token_false_id = tokenizer.convert_tokens_to_ids("no")
+        self._prefix_tokens = tokenizer.encode(self._SYSTEM_PROMPT, add_special_tokens=False)
+        self._suffix_tokens = tokenizer.encode(self._RESPONSE_TEMPLATE, add_special_tokens=False)
+        logger.info(
+            "%s loaded (%s, dtype=%s, true_id=%s, false_id=%s)",
+            self._model_name, device, dtype,
+            self._token_true_id, self._token_false_id,
+        )
+
+    def _format_pair(self, query: str, doc: str) -> str:
+        return (
+            f"<Instruct>: {self._instruction}\n"
+            f"<Query>: {query}\n"
+            f"<Document>: {doc}"
+        )
+
+    def _score_batch_sync(self, query: str, texts: list[str]) -> list[float]:
+        import torch
+
+        pairs = [self._format_pair(query, t) for t in texts]
+        usable_len = self._max_length - len(self._prefix_tokens) - len(self._suffix_tokens)
+        inputs = self._tokenizer(
+            pairs,
+            padding=False,
+            truncation="longest_first",
+            return_attention_mask=False,
+            max_length=usable_len,
+        )
+        for i, ids in enumerate(inputs["input_ids"]):
+            inputs["input_ids"][i] = self._prefix_tokens + ids + self._suffix_tokens
+        inputs = self._tokenizer.pad(
+            inputs,
+            padding=True,
+            return_tensors="pt",
+            max_length=self._max_length,
+        )
+        inputs = {k: v.to(self._model.device) for k, v in inputs.items()}
+
+        with torch.no_grad():
+            logits = self._model(**inputs).logits[:, -1, :]
+
+        true_vec = logits[:, self._token_true_id]
+        false_vec = logits[:, self._token_false_id]
+        stacked = torch.stack([false_vec, true_vec], dim=1)
+        log_probs = torch.nn.functional.log_softmax(stacked, dim=1)
+        return log_probs[:, 1].exp().tolist()
 
     async def rerank(
         self,
@@ -166,16 +276,43 @@ class QwenReranker(Reranker):
         *,
         top_k: int | None = None,
     ) -> list[tuple[RerankCandidate, float]]:
-        raise NotImplementedError(
-            "QwenReranker is a stub. Install torch+transformers and implement "
-            "the forward pass to enable Qwen3-Reranker-{4B,8B}."
-        )
+        if not candidates:
+            return []
+        self._load()
+
+        loop = asyncio.get_event_loop()
+        texts = [c.content for c in candidates]
+        all_scores: list[float] = []
+        for i in range(0, len(texts), self._batch_size):
+            batch = texts[i : i + self._batch_size]
+            scores = await loop.run_in_executor(
+                None, lambda b=batch: self._score_batch_sync(query, b)
+            )
+            all_scores.extend(scores)
+
+        scored = list(zip(candidates, all_scores))
+        scored.sort(key=lambda kv: kv[1], reverse=True)
+        if top_k:
+            scored = scored[:top_k]
+        return scored
 
 
-def build_default_reranker(model_name: str | None = None) -> Reranker:
-    """Factory that returns FastEmbedReranker if a model name is given, else NoOp."""
+def build_default_reranker(
+    model_name: str | None = None,
+    instruction: str | None = None,
+) -> Reranker:
+    """
+    Factory that returns the appropriate Reranker for the given model name.
+
+    - None / "noop"           → NoOpReranker (first-stage order, no scoring)
+    - "Qwen/Qwen3-Reranker-*" → QwenReranker (CausalLM, requires torch+transformers)
+    - anything else           → FastEmbedReranker (ONNX cross-encoder, no extra deps)
+
+    instruction is forwarded to QwenReranker only; FastEmbed rerankers ignore it.
+    Custom instructions improve Qwen reranker quality by ~1-5% on focused tasks.
+    """
     if not model_name or model_name.lower() == "noop":
         return NoOpReranker()
     if model_name.startswith("Qwen/"):
-        return QwenReranker(model_name=model_name)
+        return QwenReranker(model_name=model_name, instruction=instruction)
     return FastEmbedReranker(model_name=model_name)

@@ -66,6 +66,37 @@ def test_build_chunks_uses_conservative_env_chunk_size(monkeypatch):
     assert chunks[0].metadata["total_chunks"] == 2
 
 
+def test_build_chunks_normalizes_internal_whitespace():
+    """PDF extractors produce double-spaced text from column layouts.
+    build_chunks should collapse multiple spaces to one so phrase matching works."""
+    doc = ExtractedDocument(
+        text="Critical  reading,  critical  thinking,  discussion  skills.",
+        extractor_used="test",
+        char_count=60,
+    )
+
+    chunks = build_chunks(doc, {"source": "unit"})
+
+    assert len(chunks) == 1
+    assert "Critical reading, critical thinking, discussion skills." in chunks[0].text
+
+
+def test_build_chunks_normalizes_tabs_but_preserves_newlines():
+    """Tabs are collapsed to spaces; paragraph-separating newlines are kept."""
+    doc = ExtractedDocument(
+        text="First\tparagraph.\n\nSecond\t\tparagraph.",
+        extractor_used="test",
+        char_count=38,
+    )
+
+    chunks = build_chunks(doc, {"source": "unit"})
+
+    # Both paragraphs should be present and tabs collapsed
+    combined = " ".join(c.text for c in chunks)
+    assert "First paragraph." in combined
+    assert "Second paragraph." in combined
+
+
 def test_docx_tables_are_extracted_in_document_order(tmp_path):
     from docx import Document
 

@@ -163,6 +163,9 @@ cython_debug/
 
 # Project-specific settings
 .aider*
+.claude/
+.mcp.json
+test-1/
 .DS_Store
 src/.DS_Store
 .local/

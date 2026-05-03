@@ -101,7 +101,12 @@ def build_chunks(doc: ExtractedDocument, file_metadata: dict) -> list[Chunk]:
         max(0, chunk_size - 1),
     )
     stride = max(1, chunk_size - chunk_overlap)
-    paragraphs = [p.strip() for p in re.split(r"\n{2,}", doc.text) if p.strip()]
+    # Normalize internal whitespace: collapse multiple spaces/tabs to one.
+    # PDF extractors (pdfminer, pdfplumber) often produce double-spaced text
+    # from two-column or justified layouts.  This prevents search phrase
+    # mismatches while preserving paragraph structure.
+    normalized = re.sub(r"[^\S\n]+", " ", doc.text)
+    paragraphs = [p.strip() for p in re.split(r"\n{2,}", normalized) if p.strip()]
     raw_chunks: list[str] = []
     current = ""
 

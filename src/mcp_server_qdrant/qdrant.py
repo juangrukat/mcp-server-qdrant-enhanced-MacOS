@@ -1,7 +1,18 @@
+import contextvars
 import logging
 import os
 import uuid
 from typing import Any
+
+# Per-asyncio-task list of retrieval warnings (sparse fallback, etc.).
+# Set by callers that want to capture warnings in the observability envelope.
+# Usage:
+#   sink = []; _retrieval_warnings.set(sink)
+#   results = await connector.search_hybrid_rrf(...)
+#   acc.warnings.extend(sink)
+_retrieval_warnings: contextvars.ContextVar[list[str] | None] = contextvars.ContextVar(
+    "_retrieval_warnings", default=None
+)
 
 from pydantic import BaseModel
 from qdrant_client import AsyncQdrantClient, models
@@ -318,6 +329,20 @@ class QdrantConnector:
             )
         except Exception as e:
             logger.error(f"Error getting collection info for {collection_name}: {e}")
+            return None
+
+    async def get_sparse_vector_name(self, collection_name: str) -> str | None:
+        """
+        Return the first sparse vector name configured on the collection,
+        or None if the collection has no sparse vectors (dense-only).
+        """
+        try:
+            info = await self._client.get_collection(collection_name)
+            sparse = getattr(info.config.params, "sparse_vectors", None)
+            if sparse:
+                return next(iter(sparse), None)
+            return None
+        except Exception:
             return None
 
     async def create_collection_with_config(
@@ -742,43 +767,56 @@ class QdrantConnector:
         sparse_provider,
         embedding_provider: EmbeddingProvider | None = None,
     ) -> int:
-        """Store entries with both dense and sparse vectors."""
+        """Store entries with both dense and sparse vectors, batched for memory safety."""
+        dense_provider = embedding_provider or self._embedding_provider
+        dense_name = dense_provider.get_vector_name()
+        sparse_name = sparse_provider.get_vector_name()
+        batch_size = _embedding_batch_size()
+        stored = 0
         try:
-            dense_provider = embedding_provider or self._embedding_provider
-            documents = [e.content for e in entries]
-            dense = await dense_provider.embed_documents(documents)
-            sparse = await sparse_provider.embed_documents(documents)
+            for start in range(0, len(entries), batch_size):
+                entry_batch = entries[start : start + batch_size]
+                documents = [e.content for e in entry_batch]
+                try:
+                    dense = await dense_provider.embed_documents(documents)
+                    sparse = await sparse_provider.embed_documents(documents)
+                except Exception as e:
+                    logger.error(
+                        "Error embedding hybrid batch %s-%s in %r: %s",
+                        start, start + len(entry_batch), collection_name, e,
+                    )
+                    raise
 
-            dense_name = dense_provider.get_vector_name()
-            sparse_name = sparse_provider.get_vector_name()
+                points = []
+                for i, entry in enumerate(entry_batch):
+                    if entry.id:
+                        try:
+                            point_id = str(uuid.UUID(entry.id)).replace("-", "")
+                        except ValueError:
+                            point_id = uuid.uuid5(uuid.NAMESPACE_DNS, entry.id).hex
+                    else:
+                        point_id = uuid.uuid4().hex
 
-            points = []
-            for i, entry in enumerate(entries):
-                if entry.id:
-                    try:
-                        point_id = str(uuid.UUID(entry.id)).replace("-", "")
-                    except ValueError:
-                        point_id = uuid.uuid5(uuid.NAMESPACE_DNS, entry.id).hex
-                else:
-                    point_id = uuid.uuid4().hex
+                    points.append(models.PointStruct(
+                        id=point_id,
+                        payload={"document": entry.content, METADATA_PATH: entry.metadata or {}},
+                        vector={
+                            dense_name: dense[i],
+                            sparse_name: models.SparseVector(
+                                indices=sparse[i]["indices"],
+                                values=sparse[i]["values"],
+                            ),
+                        },
+                    ))
 
-                points.append(models.PointStruct(
-                    id=point_id,
-                    payload={"document": entry.content, METADATA_PATH: entry.metadata or {}},
-                    vector={
-                        dense_name: dense[i],
-                        sparse_name: models.SparseVector(
-                            indices=sparse[i]["indices"],
-                            values=sparse[i]["values"],
-                        ),
-                    },
-                ))
+                await self._client.upsert(collection_name=collection_name, points=points, wait=True)
+                stored += len(points)
 
-            await self._client.upsert(collection_name=collection_name, points=points, wait=True)
-            return len(entries)
+            logger.info("Hybrid stored %s entries in %r.", stored, collection_name)
+            return stored
         except Exception as e:
-            logger.error(f"Error in batch_store_hybrid: {e}")
-            return 0
+            logger.error("Error in batch_store_hybrid: %s (stored %s so far)", e, stored)
+            return stored
 
     async def search_hybrid_rrf(
         self,
@@ -793,10 +831,19 @@ class QdrantConnector:
     ) -> list[tuple[Entry, float]]:
         """
         Hybrid search using Qdrant's Query API with prefetch + Reciprocal Rank Fusion.
-        Runs dense and sparse retrieval in parallel server-side, then fuses ranks.
+
+        Falls back to dense-only search when sparse retrieval is unavailable or fails.
+        The most common cause of fallback is a collection that was created without a
+        sparse vector slot (dense-only), or a sparse vector name mismatch after
+        changing QDRANT_SPARSE_MODEL on an existing collection.
+
+        The fallback is intentional and safe: dense-only results are still returned
+        so mode="hybrid" and mode="rerank" never produce empty results just because
+        BM25/BM42 is absent. A warning is logged so the issue is visible.
         """
+        dense_provider = embedding_provider or self._embedding_provider
+
         try:
-            dense_provider = embedding_provider or self._embedding_provider
             dense_vector = await dense_provider.embed_query(query)
             sparse_vector = await sparse_provider.embed_query(query)
 
@@ -827,10 +874,50 @@ class QdrantConnector:
                 with_payload=True,
                 with_vectors=False,
             )
-            return self._process_scored_results(response.points)
+            results = self._process_scored_results(response.points)
+
+            # RRF returned empty despite a valid call — sparse prefetch may have
+            # had 0 matches but dense would have matched. Fall back to dense-only
+            # so we don't silently return nothing.
+            if not results:
+                msg = (
+                    f"RRF fusion returned 0 results for collection {collection_name!r} "
+                    "(sparse had no matches). Returning dense-only results."
+                )
+                logger.warning(msg)
+                _w = _retrieval_warnings.get(None)
+                if _w is not None:
+                    _w.append(msg)
+                return await self._hybrid_search_client_side(
+                    query, collection_name, limit, query_filter, None, dense_provider
+                )
+
+            return results
+
         except Exception as e:
-            logger.error(f"Error in search_hybrid_rrf: {e}")
-            return []
+            # Common causes:
+            #   - Collection has no sparse vector slot (dense-only collection)
+            #   - Sparse vector name mismatch (QDRANT_SPARSE_MODEL changed after creation)
+            #   - BM25/BM42 model changed after collection creation
+            msg = (
+                f"Hybrid RRF failed for collection {collection_name!r}: {e}. "
+                "Returning dense-only results. "
+                "To enable hybrid, recreate the collection with create_hybrid_collection."
+            )
+            logger.warning(msg)
+            _w = _retrieval_warnings.get(None)
+            if _w is not None:
+                _w.append(msg)
+            try:
+                return await self._hybrid_search_client_side(
+                    query, collection_name, limit, query_filter, None, dense_provider
+                )
+            except Exception as fallback_err:
+                logger.error(
+                    "Dense fallback also failed for collection %r: %s",
+                    collection_name, fallback_err,
+                )
+                return []
 
     async def search_late_interaction(
         self,

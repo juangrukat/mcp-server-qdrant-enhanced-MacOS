@@ -129,13 +129,14 @@ class QdrantMCPServer(FastMCP):
             make_indexes(self.qdrant_settings.filterable_fields_dict()),
         )
 
-    def get_sparse_provider(self, model_name: str = "Qdrant/bm25"):
+    def get_sparse_provider(self, model_name: str | None = None):
         """Lazily initialize and cache sparse providers by model name."""
-        provider = self._sparse_providers.get(model_name)
+        name = model_name or self.qdrant_settings.sparse_model
+        provider = self._sparse_providers.get(name)
         if provider is None:
             from mcp_server_qdrant.embeddings.sparse import SparseEmbeddingProvider
-            provider = SparseEmbeddingProvider(model_name)
-            self._sparse_providers[model_name] = provider
+            provider = SparseEmbeddingProvider(name)
+            self._sparse_providers[name] = provider
         return provider
 
     def get_late_interaction_provider(self, model_name: str = "colbert-ir/colbertv2.0"):
@@ -639,7 +640,11 @@ class QdrantMCPServer(FastMCP):
             chunks_per_document: Annotated[int, Field(description="Best chunks to surface per document")] = 4,
             filter: Annotated[dict | None, Field(description="High-level filter: {must, should, must_not}")] = None,
             mode: Annotated[str, Field(description="'dense' | 'hybrid' | 'rerank' | 'late_interaction'")] = "dense",
-            reranker_model: Annotated[str | None, Field(description="Reranker for mode='rerank' (default Xenova/ms-marco-MiniLM-L-6-v2)")] = None,
+            reranker_model: Annotated[str | None, Field(description="Reranker for mode='rerank'. FastEmbed: 'Xenova/ms-marco-MiniLM-L-6-v2', 'BAAI/bge-reranker-base'. Qwen3 (requires torch+transformers): 'Qwen/Qwen3-Reranker-4B', 'Qwen/Qwen3-Reranker-0.6B'. Defaults to QDRANT_RERANKER_MODEL env var.")] = None,
+            reranker_instruction: Annotated[str | None, Field(description="Task instruction for Qwen3 rerankers. Improves quality 1-5% when tailored to the domain. Example: 'Retrieve passages that directly answer the question using explicit claims or evidence.'")] = None,
+            prefetch_limit: Annotated[int | None, Field(description="Candidate pool size before grouping/reranking. None = auto (100 with reranker, 80 without). Raise to 120-150 for better recall with Qwen3-Reranker-4B.")] = None,
+            rerank_top_k: Annotated[int | None, Field(description="Max candidates scored by the reranker. None = all prefetched. Limit to 60-80 to speed up Qwen3 reranking.")] = None,
+            additional_queries: Annotated[list[str] | None, Field(description="Extra retrieval queries run in parallel with the primary query. Their candidate pools are merged and deduplicated before reranking. The primary query is ALWAYS used for reranking scores. Use these to preserve rare or domain-specific terms the primary query alone may miss. Example: ['Adler Three Columns Enlargement of the Understanding maieutic', 'critical reading vocabulary student ownership empowerment']")] = None,
             embedding_model: Annotated[str | None, Field(description="Override the embedding model for this request only (multi-agent safe)")] = None,
             late_interaction_model: Annotated[str, Field(description="Late-interaction model for mode='late_interaction'")] = "colbert-ir/colbertv2.0",
         ) -> dict:
@@ -676,9 +681,28 @@ class QdrantMCPServer(FastMCP):
 
                     reranker = None
                     if rmode == RetrievalMode.RERANK:
-                        reranker_name = reranker_model or "Xenova/ms-marco-MiniLM-L-6-v2"
-                        reranker = build_default_reranker(reranker_name)
+                        reranker_name = reranker_model or self.qdrant_settings.default_reranker_model
+                        effective_instruction = (
+                            reranker_instruction
+                            or self.qdrant_settings.reranker_instruction
+                        )
+                        reranker = build_default_reranker(reranker_name, instruction=effective_instruction)
                         acc.stats["reranker_model"] = reranker_name
+
+                    # Prefetch / rerank-top-k: explicit arg > settings > auto (None)
+                    effective_prefetch = prefetch_limit or (
+                        self.qdrant_settings.rerank_prefetch_limit or None
+                    )
+                    effective_rerank_top_k = rerank_top_k or (
+                        self.qdrant_settings.rerank_top_k or None
+                    )
+
+                    if additional_queries:
+                        acc.stats["additional_queries_count"] = len(additional_queries)
+
+                    from mcp_server_qdrant.qdrant import _retrieval_warnings
+                    _warnings_sink: list[str] = []
+                    _retrieval_warnings.set(_warnings_sink)
 
                     docs = await search_documents_grouped(
                         self.qdrant_connector,
@@ -691,7 +715,12 @@ class QdrantMCPServer(FastMCP):
                         late_interaction_provider=late_interaction_provider,
                         reranker=reranker,
                         embedding_provider=request_provider,
+                        prefetch_limit=effective_prefetch,
+                        rerank_top_k=effective_rerank_top_k,
+                        additional_queries=additional_queries or None,
                     )
+
+                    acc.warnings.extend(_warnings_sink)
                     acc.stats["raw_chunks_fetched"] = sum(len(d["chunks"]) for d in docs)
                     acc.stats["documents_returned"] = len(docs)
 

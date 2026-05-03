@@ -246,6 +246,48 @@ class QdrantSettings(BaseSettings):
         validation_alias="QDRANT_MCP_TOOL_PROFILE",
     )
 
+    # Sparse model for hybrid retrieval.
+    # "Qdrant/bm25" is the pure-algorithmic default (no download).
+    # "Qdrant/bm42-all-minilm-l6-v2-attentions" is a neural BM25 improvement.
+    sparse_model: str = Field(
+        default="Qdrant/bm25",
+        validation_alias="QDRANT_SPARSE_MODEL",
+    )
+
+    # Default reranker for mode="rerank". Overridable per-request via reranker_model arg.
+    # FastEmbed cross-encoders: "Xenova/ms-marco-MiniLM-L-6-v2", "BAAI/bge-reranker-base"
+    # Qwen3 generative rerankers (requires torch+transformers): "Qwen/Qwen3-Reranker-4B"
+    default_reranker_model: str = Field(
+        default="Xenova/ms-marco-MiniLM-L-6-v2",
+        validation_alias="QDRANT_RERANKER_MODEL",
+    )
+
+    # Reranker instruction for Qwen3-Reranker models. Improving specificity
+    # toward your retrieval task raises nDCG by ~1-5%.
+    # Example: "Retrieve passages that directly answer the question using
+    #   explicit claims, definitions, or cited evidence from the document."
+    reranker_instruction: str | None = Field(
+        default=None,
+        validation_alias="QDRANT_RERANKER_INSTRUCTION",
+        description="Task instruction for Qwen3 generative rerankers.",
+    )
+
+    # Candidate pool size before reranking. 0 = auto (100 with reranker, 80 without).
+    # Raise to 120-150 for better recall when using Qwen3-Reranker-4B on book PDFs.
+    rerank_prefetch_limit: int = Field(
+        default=0,
+        validation_alias="QDRANT_RERANK_PREFETCH_LIMIT",
+        description="Raw candidate pool size fed to the reranker. 0 = auto.",
+    )
+
+    # Max chunks fed to the reranker from the candidate pool. 0 = all candidates.
+    # Limiting to 60-80 speeds up Qwen3 reranking with minimal quality loss.
+    rerank_top_k: int = Field(
+        default=0,
+        validation_alias="QDRANT_RERANK_TOP_K",
+        description="Max candidates scored by the reranker. 0 = all prefetched.",
+    )
+
     def filterable_fields_dict(self) -> dict[str, FilterableField]:
         if self.filterable_fields is None:
             return {}

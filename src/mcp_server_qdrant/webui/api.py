@@ -32,6 +32,14 @@ class CollectionCreateRequest(BaseModel):
     distance: str = "cosine"
 
 
+class HybridCollectionCreateRequest(BaseModel):
+    collection_name: str
+    embedding_model: str
+    vector_size: int = 0  # 0 = infer from model
+    distance: str = "cosine"
+    sparse_model: str = "Qdrant/bm25"  # BM25 by default
+
+
 class StoreRequest(BaseModel):
     content: str
     collection_name: str
@@ -58,6 +66,12 @@ class SearchDocumentsRequest(BaseModel):
     limit: int = 10
     chunks_per_document: int = 4
     filter: Optional[dict] = None
+    mode: str = "dense"
+    additional_queries: Optional[list[str]] = None
+    prefetch_limit: Optional[int] = None
+    rerank_top_k: Optional[int] = None
+    reranker_model: Optional[str] = None
+    reranker_instruction: Optional[str] = None
 
 
 class IngestFileRequest(BaseModel):
@@ -173,6 +187,36 @@ def create_app(
             "embedding_model": req.embedding_model,
         }
 
+    @app.post("/collections/hybrid", status_code=201)
+    async def create_hybrid_collection(req: HybridCollectionCreateRequest) -> dict:
+        info = embedding_manager.get_model_info(req.embedding_model)
+        if not info:
+            raise HTTPException(status_code=400, detail=f"Unknown embedding model: {req.embedding_model}")
+
+        size = req.vector_size or info.vector_size
+        provider = embedding_manager.create_provider_for_model(req.embedding_model)
+        dense_vector_name = provider.get_vector_name()
+        sparse_vector_name = f"sparse-bm25"
+
+        success = await connector.create_hybrid_collection(
+            req.collection_name,
+            dense_size=size,
+            dense_vector_name=dense_vector_name,
+            sparse_vector_name=sparse_vector_name,
+            distance=req.distance,
+        )
+        if not success:
+            raise HTTPException(status_code=500, detail="Failed to create hybrid collection")
+        return {
+            "collection_name": req.collection_name,
+            "vector_size": size,
+            "distance": req.distance,
+            "embedding_model": req.embedding_model,
+            "sparse_model": req.sparse_model,
+            "dense_vector_name": dense_vector_name,
+            "sparse_vector_name": sparse_vector_name,
+        }
+
     @app.delete("/collections/{name}")
     async def delete_collection(name: str) -> dict:
         ok = await connector.delete_collection(name)
@@ -260,8 +304,27 @@ def create_app(
     async def search_documents(req: SearchDocumentsRequest) -> dict:
         from mcp_server_qdrant.search.document_search import search_documents_grouped
         from mcp_server_qdrant.search.filter_grammar import compile_filter
+        from mcp_server_qdrant.search.retrieval_mode import RetrievalMode
+        from mcp_server_qdrant.embeddings.sparse import SparseEmbeddingProvider
+        from mcp_server_qdrant.search.reranker import build_default_reranker
+        from mcp_server_qdrant.qdrant import _retrieval_warnings
 
         qfilter = compile_filter(req.filter) if req.filter else None
+        rmode = RetrievalMode.parse(req.mode)
+        use_sparse = rmode in (RetrievalMode.HYBRID, RetrievalMode.RERANK)
+        sparse_provider = SparseEmbeddingProvider(qdrant_settings.sparse_model) if use_sparse else None
+
+        reranker = None
+        if rmode == RetrievalMode.RERANK:
+            reranker_name = req.reranker_model or qdrant_settings.default_reranker_model
+            reranker = build_default_reranker(
+                reranker_name,
+                instruction=req.reranker_instruction or qdrant_settings.reranker_instruction,
+            )
+
+        warnings_sink: list[str] = []
+        _retrieval_warnings.set(warnings_sink)
+
         groups = await search_documents_grouped(
             connector,
             query=req.query,
@@ -269,8 +332,17 @@ def create_app(
             limit=req.limit,
             chunks_per_document=req.chunks_per_document,
             query_filter=qfilter,
+            sparse_provider=sparse_provider,
+            reranker=reranker,
+            embedding_provider=embedding_provider,
+            prefetch_limit=req.prefetch_limit,
+            rerank_top_k=req.rerank_top_k,
+            additional_queries=req.additional_queries or None,
         )
-        return {"documents": groups}
+        return {
+            "documents": groups,
+            "warnings": warnings_sink or None,
+        }
 
     # --- Ingestion ---
 
@@ -312,11 +384,26 @@ def create_app(
         await connector.ensure_macos_metadata_indexes(req.collection_name)
         chunks = build_chunks(doc, file_meta)
         entries = [BatchEntry(content=c.text, metadata=c.metadata) for c in chunks]
+
+        # Auto-detect hybrid vs dense-only collection and route accordingly.
+        sparse_vector_name = await connector.get_sparse_vector_name(req.collection_name)
+        ingest_mode = "hybrid" if sparse_vector_name else "dense"
+
         try:
-            stored = await write_queue.run(
-                "ingest_file",
-                lambda: connector.batch_store(entries, req.collection_name),
-            )
+            if ingest_mode == "hybrid":
+                from mcp_server_qdrant.embeddings.sparse import SparseEmbeddingProvider
+                sparse_provider = SparseEmbeddingProvider(qdrant_settings.sparse_model)
+                stored = await write_queue.run(
+                    "ingest_file",
+                    lambda: connector.batch_store_hybrid(
+                        entries, req.collection_name, sparse_provider
+                    ),
+                )
+            else:
+                stored = await write_queue.run(
+                    "ingest_file",
+                    lambda: connector.batch_store(entries, req.collection_name),
+                )
         except WriteQueueFullError as e:
             raise HTTPException(status_code=429, detail=str(e)) from e
         return {
@@ -325,6 +412,7 @@ def create_app(
             "extractor_used": doc.extractor_used,
             "char_count": doc.char_count,
             "page_count": doc.page_count,
+            "ingest_mode": ingest_mode,
         }
 
     @app.post("/ingest/folder")
@@ -353,6 +441,15 @@ def create_app(
         await connector.ensure_macos_metadata_indexes(req.collection_name)
         ingested_at = datetime.now(timezone.utc).isoformat()
 
+        # Detect hybrid vs dense-only once for the whole folder ingest.
+        sparse_vector_name = await connector.get_sparse_vector_name(req.collection_name)
+        folder_ingest_mode = "hybrid" if sparse_vector_name else "dense"
+        if folder_ingest_mode == "hybrid":
+            from mcp_server_qdrant.embeddings.sparse import SparseEmbeddingProvider
+            sparse_provider_folder = SparseEmbeddingProvider(qdrant_settings.sparse_model)
+        else:
+            sparse_provider_folder = None
+
         total_chunks = 0
         files_done = 0
         errors: list[dict] = []
@@ -380,10 +477,17 @@ def create_app(
 
                 chunks = build_chunks(doc, file_meta)
                 entries = [BatchEntry(content=c.text, metadata=c.metadata) for c in chunks]
-                stored = await write_queue.run(
-                    "ingest_folder",
-                    lambda: connector.batch_store(entries, req.collection_name),
-                )
+                if folder_ingest_mode == "hybrid":
+                    _sp = sparse_provider_folder
+                    stored = await write_queue.run(
+                        "ingest_folder",
+                        lambda: connector.batch_store_hybrid(entries, req.collection_name, _sp),
+                    )
+                else:
+                    stored = await write_queue.run(
+                        "ingest_folder",
+                        lambda: connector.batch_store(entries, req.collection_name),
+                    )
                 total_chunks += stored
                 files_done += 1
             except WriteQueueFullError as e:

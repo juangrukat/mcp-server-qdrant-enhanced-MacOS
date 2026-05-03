@@ -1,81 +1,95 @@
 # mcp-server-qdrant-enhanced
 
-A production-minded Python server that extends the Qdrant Model Context Protocol
-workflow with document ingestion, document-level semantic search, hybrid
-dense/sparse retrieval, dynamic FastEmbed model selection, MCP tool profiles,
-secure streamable HTTP transport, and a FastAPI interface for non-MCP clients.
+A production-minded Python server that extends the Qdrant MCP workflow with
+two-stage hybrid retrieval, document-level semantic search, Qwen3 embeddings
+and reranking on Apple Silicon Metal, dynamic model selection, MCP tool
+profiles, secure streamable HTTP transport, and a FastAPI interface for
+non-MCP clients.
 
-This project began as an enhancement of the base Qdrant MCP server, but has
-grown into a broader local AI retrieval layer for desktop agents, MCP clients,
-and API consumers. It focuses on practical retrieval workflows: ingesting files,
-preserving useful metadata, searching by distinct documents instead of raw
-chunks, exposing a configurable tool surface, and supporting safer multi-agent
-usage over HTTP.
+This project began as an enhancement of the base Qdrant MCP server but has
+grown into a practical local AI retrieval layer for desktop agents, MCP
+clients, and API consumers. The focus is on retrieval that actually works at
+book scale: ingesting files, preserving metadata, searching by distinct
+documents rather than raw chunks, and surfacing the right evidence passages.
+
+---
+
+## Architecture
+
+```mermaid
+flowchart TD
+    subgraph Ingestion
+        SRC["Source files\n(PDF, DOCX, MD, JSON, CSV, code…)"]
+        EXT["Extractor\n(pdfminer / pypdf / python-docx / text)"]
+        CHUNK["Paragraph-aware chunker\n700 char / 70 overlap"]
+        EMB["Qwen3-Embedding-4B\n(Rust sidecar · Metal/MPS)"]
+        SPARSE_EMB["BM25 / BM42\n(fastembed · CPU)"]
+        QDRANT[("Qdrant\n(embedded or server)")]
+    end
+
+    subgraph Two-stage Retrieval
+        Q["User query"]
+        DENSE_Q["Dense query vector\nQwen3-Embedding-4B"]
+        SPARSE_Q["Sparse query vector\nBM25 / BM42"]
+        PREFETCH["Prefetch pool\n80–150 candidates\n(Qdrant RRF fusion)"]
+        RERANKER["Qwen3-Reranker-4B\n(CausalLM · MPS)\nP(yes | query, chunk)"]
+        DIVERSITY["Diversity pass\n≤2 chunks per page/section"]
+        GROUP["Group by document_id\nTop N documents"]
+        OUT["Structured result\n{document, score, chunks[]}"]
+    end
+
+    SRC --> EXT --> CHUNK
+    CHUNK --> EMB --> QDRANT
+    CHUNK --> SPARSE_EMB --> QDRANT
+
+    Q --> DENSE_Q --> PREFETCH
+    Q --> SPARSE_Q --> PREFETCH
+    PREFETCH -->|mode=rerank| RERANKER --> DIVERSITY --> GROUP --> OUT
+    PREFETCH -->|mode=hybrid| GROUP --> OUT
+    PREFETCH -->|mode=dense| GROUP --> OUT
+```
+
+**Components in production use:**
+
+| Component | Model / library | Device |
+| --- | --- | --- |
+| Dense embeddings | `Qwen/Qwen3-Embedding-4B` | Metal (Rust/Candle sidecar) |
+| Sparse embeddings | `Qdrant/bm25` (or BM42) | CPU (fastembed) |
+| Vector store | Qdrant v1.17 (embedded or Docker server) | — |
+| Reranker | `Qwen/Qwen3-Reranker-4B` | MPS (torch + transformers) |
+| Fallback reranker | `Xenova/ms-marco-MiniLM-L-6-v2` | CPU (fastembed ONNX) |
+| MCP transport | FastMCP streamable HTTP or stdio | — |
+| REST API | FastAPI | — |
+
+---
 
 ## What changed from the original
 
-Compared with the original Qdrant MCP server, this version adds:
+Compared with the original Qdrant MCP server:
 
-- File and folder ingestion for Markdown, text, structured data, PDFs, DOCX,
-  and common code/config formats.
-- Document-grouped retrieval through `search_documents`, which returns distinct
-  documents ranked by their strongest chunks.
-- Hybrid dense + sparse search using FastEmbed dense models and Qdrant BM25
-  sparse vectors.
-- Optional rerank and late-interaction search modes for more advanced retrieval.
-- Dynamic per-collection embedding model selection.
-- MCP tool profiles (`minimal`, `canonical`, `full`) to control how much tool
-  surface a client sees.
-- Streamable HTTP support with loopback binding, Origin validation, and optional
+- **Two-stage retrieval**: dense + BM25/BM42 hybrid first stage → Qwen3-Reranker
+  second stage, with a diversity pass to reduce adjacent-chunk redundancy.
+- **Qwen3 embedding sidecar**: Rust binary using fastembed + Candle for
+  Metal-accelerated Qwen3-Embedding-{0.6B,4B,8B} on Apple Silicon.
+- **Qwen3-Reranker-{0.6B,4B,8B}**: fully implemented generative reranker via
+  transformers `AutoModelForCausalLM`, auto-selects MPS/CUDA/CPU, custom
+  task instruction support.
+- **Document-grouped retrieval** through `search_documents`, which returns
+  distinct documents ranked by their strongest chunks.
+- **Hybrid dense + sparse search** using FastEmbed dense models and Qdrant
+  BM25/BM42 sparse vectors with reciprocal rank fusion.
+- **Optional reranker and late-interaction** search modes.
+- **Dynamic per-collection embedding model selection**.
+- **MCP tool profiles** (`minimal`, `canonical`, `full`).
+- **Streamable HTTP** with loopback binding, Origin validation, and optional
   Bearer token auth.
-- A FastAPI application exposing the same Qdrant connector and ingestion
-  pipeline to non-MCP clients.
-- Structured response envelopes for priority tools.
-- Report/apply gating for expensive or destructive actions such as folder
-  ingestion and collection deletion.
-- macOS-aware metadata capture through filesystem, Spotlight, and Finder metadata.
+- **FastAPI** exposing the same connector and ingestion pipeline to non-MCP clients.
+- **Structured response envelopes** for priority tools.
+- **Report/apply gating** for folder ingestion and collection deletion.
+- **macOS Spotlight and Finder metadata** capture during ingestion.
+- **Bounded write queue** for safe multi-agent ingestion concurrency.
 
-## Why this project matters
-
-This repository demonstrates practical AI infrastructure work across retrieval,
-tool design, local-first agent workflows, API design, safety controls, and
-developer experience. It is intended to be useful both as an MCP server and as
-a reference implementation for building safer, more capable retrieval systems
-around Qdrant.
-
-## Current project state
-
-This repository is in active development.
-
-- The package is a Python project named `mcp-server-qdrant` in `pyproject.toml`.
-- The main MCP entry point is `mcp-server-qdrant`.
-- The REST API entry point is `mcp-server-qdrant-webui`.
-- The default MCP tool profile is `canonical`.
-- The five discovery tools (`get_indexed_fields`, `get_supported_extractors`,
-  `get_collection_schema`, `list_search_modes`, `get_server_capabilities`) are
-  implemented and registered under the `minimal` profile.
-- Streamable HTTP transport is supported alongside `stdio`, with loopback
-  binding, Origin validation, and optional Bearer token auth.
-- Embedding-provider state is resolved per request rather than mutated globally,
-  so multiple agents can share one HTTP server safely.
-- `delete_collection` and `ingest_folder` support a report/apply gating pattern
-  with a single-use `plan_id` and a 10-minute TTL.
-
-## What it does
-
-At a high level, the server lets an MCP client or HTTP client:
-
-- Create and inspect Qdrant collections.
-- Store individual text entries or batches.
-- Ingest plain-text-ish files, structured `.json`/`.jsonl`/`.csv`/`.tsv`,
-  PDFs, and DOCX files.
-- Capture macOS Spotlight and Finder metadata while ingesting files.
-- Search by semantic similarity.
-- Search by distinct document instead of raw chunks.
-- Filter searches using a compact high-level filter grammar.
-- Use FastEmbed dense embedding models, including supplemental Qwen3 entries.
-- Create hybrid collections with dense vectors plus Qdrant BM25 sparse vectors.
-- Run over MCP stdio, MCP SSE, MCP streamable HTTP, or the included FastAPI app.
+---
 
 ## Installation
 
@@ -85,12 +99,18 @@ Requirements:
 - `uv`
 - Rust toolchain, if building the Qwen3 sidecar locally
 - Docker, recommended for multi-agent Qdrant server mode
-- macOS, if you want Spotlight/Finder metadata extraction
+- macOS, if you want Metal embedding and Spotlight/Finder metadata
 
-Install dependencies from the repository root:
+Install core dependencies:
 
 ```bash
 uv sync --frozen --group dev
+```
+
+Install optional Qwen3 reranker dependencies (torch + transformers):
+
+```bash
+uv pip install 'mcp-server-qdrant[reranking]'
 ```
 
 Run tests:
@@ -99,168 +119,232 @@ Run tests:
 uv run --locked pytest
 ```
 
-## Local Apple Silicon Qwen3 Setup
+---
 
-For local desktop use, this repo includes helper scripts that keep runtime
-state out of Git:
+## Local Apple Silicon setup
+
+Helper scripts keep runtime state out of Git:
 
 ```bash
 ./scripts/local-install.sh
 ./scripts/local-run-qdrant.sh
+./scripts/check-server-qdrant.sh
+./scripts/smoke-test-server-mcp.sh
 ./scripts/local-configure-hermes.py
 ./scripts/local-doctor.sh
 ./scripts/local-run-webui.sh
-./scripts/local-run-mcp.sh
+./scripts/run-server-mcp.sh
 ```
 
-Runtime state goes under `.local/`, while `.gitignore` excludes `.local/`,
+Runtime state goes under `.local/`. The `.gitignore` excludes `.local/`,
 `storage/`, `logs/`, and `.DS_Store`.
 
-Qwen3 embedding models are routed through a Rust sidecar at:
+### Recommended local setup
+
+Use one standard generic server-mode path for local work:
+
+```bash
+./scripts/local-run-qdrant.sh
+./scripts/smoke-test-server-mcp.sh
+./scripts/run-server-mcp.sh
+```
+
+Standard mode is Docker/server-mode Qdrant:
+
+| Setting | Value |
+| --- | --- |
+| Qdrant mode | `QDRANT_MODE=server` |
+| Qdrant URL | `http://127.0.0.1:6333` |
+| Collection | user-configurable |
+| Optional collection env var | `QDRANT_COLLECTION_NAME` |
+
+`./scripts/run-server-mcp.sh` is the recommended MCP entrypoint. It sets
+server mode explicitly and never opens embedded storage. It does not choose a
+default collection.
+
+Use `./scripts/check-server-qdrant.sh` to inspect server collections and whether
+they are dense-only or hybrid. Use `./scripts/smoke-test-server-mcp.sh` for a
+generic MCP readiness check. To check a specific collection:
+
+```bash
+QDRANT_COLLECTION_NAME=my_collection ./scripts/smoke-test-server-mcp.sh
+```
+
+Reset safely without deleting data:
+
+```bash
+./scripts/reset-server-qdrant.sh
+```
+
+That stops local MCP/REST/embedder processes and leaves Docker plus all storage
+unchanged. Add `--stop-docker` or `--remove-docker` only when you want to stop
+the Qdrant container. Add `--wipe` only when you intentionally want to delete
+server-mode Qdrant storage. Embedded storage is never deleted unless
+`--wipe-embedded` is passed.
+
+### Example/test collection: Socratic Circles
+
+`socratic_circles_hybrid_v2` is an example/test collection for the Socratic
+Circles diagnostic work. It is not the repo's default MCP collection.
+
+```bash
+./scripts/setup-socratic-server.sh
+./scripts/smoke-test-socratic-mcp.sh
+```
+
+Those scripts are intentionally scoped to the Socratic example dataset. They do
+not define the generic MCP setup for this repo.
+
+### Qwen3 embedding sidecar
+
+Qwen3 embedding models route through a Rust sidecar at:
 
 ```text
 rust/qwen3_embedder/target/release/qwen3-embedder
 ```
 
-Supported Qwen3 dense models:
+Supported dense models:
 
 | Model | Vector size | Local note |
 | --- | ---: | --- |
 | `Qwen/Qwen3-Embedding-0.6B` | 1024 | Fastest, lower quality |
-| `Qwen/Qwen3-Embedding-4B` | 2560 | Recommended local book-scale default |
-| `Qwen/Qwen3-Embedding-8B` | 4096 | Higher quality, much slower locally |
+| `Qwen/Qwen3-Embedding-4B` | 2560 | **Recommended local default** |
+| `Qwen/Qwen3-Embedding-8B` | 4096 | Higher quality, much slower |
 
-Recommended local REST startup for one-process embedded book ingestion:
+### Qwen3 reranker (requires `[reranking]` extras)
+
+Reranker models are loaded in-process via `transformers`:
+
+```bash
+uv pip install 'mcp-server-qdrant[reranking]'
+```
+
+| Model | Params | Speed on Apple M-series | Notes |
+| --- | --- | --- | --- |
+| `Qwen/Qwen3-Reranker-0.6B` | 0.6B | Fast (~0.1–0.2s/batch) | Good for low-latency use |
+| `Qwen/Qwen3-Reranker-4B` | 4B | Moderate (~0.5–1s/batch) | **Recommended quality default** |
+| `Qwen/Qwen3-Reranker-8B` | 8B | Slow (~2–4s/batch) | Reserved for highest-quality offline runs |
+
+The reranker auto-selects MPS on Apple Silicon, CUDA on NVIDIA, or CPU as
+fallback. It loads on first `mode="rerank"` call and stays resident.
+
+---
+
+## Launch modes
+
+| Mode | Qdrant config | Use when |
+| --- | --- | --- |
+| Embedded | `QDRANT_MODE=embedded`, `QDRANT_LOCAL_PATH=.local/qdrant-storage` | One process owns the store |
+| Server | `QDRANT_MODE=server`, `QDRANT_URL=http://127.0.0.1:6333` | REST + MCP + multiple agents need concurrent access |
+
+Embedded Qdrant locks its storage directory. If the REST API has
+`.local/qdrant-storage` open, a second stdio MCP process at the same path will
+fail. Multi-agent launch uses one Qdrant Docker server.
+
+### Single-process embedded (book ingestion, legacy)
 
 ```bash
 EMBEDDING_MODEL='Qwen/Qwen3-Embedding-4B' ./scripts/local-run-webui.sh
 ```
 
-Recommended multi-agent startup uses a shared Qdrant server instead:
+Embedded mode is single-process and should only be used for this project when
+explicitly requested. If `./scripts/local-run-mcp.sh` is run without
+`QDRANT_MODE` or `QDRANT_URL`, it warns before defaulting to embedded mode.
+
+### Multi-agent server mode
 
 ```bash
 ./scripts/local-run-qdrant.sh
 QDRANT_MODE=server EMBEDDING_MODEL='Qwen/Qwen3-Embedding-4B' ./scripts/local-run-webui.sh
-QDRANT_MODE=server EMBEDDING_MODEL='Qwen/Qwen3-Embedding-4B' ./scripts/local-run-mcp.sh --transport streamable-http
+./scripts/run-server-mcp.sh --transport streamable-http
 ```
 
-`local-run-qdrant.sh` requires a reachable Docker daemon because it runs the
-official Qdrant server container.
-
-In server mode, REST, MCP, and other local agents all connect to
-`http://127.0.0.1:6333` through `QDRANT_URL`. Do not set
-`QDRANT_LOCAL_PATH` in that mode. Server-mode MCP processes treat Qdrant as an
-external dependency and do not stop the Docker container when an MCP client
-disconnects.
-
-For Hermes, run:
+### Hermes setup
 
 ```bash
 ./scripts/local-configure-hermes.py
 hermes mcp test qdrant
 ```
 
-The Hermes helper intentionally writes the direct virtualenv entrypoint
-`.venv/bin/mcp-server-qdrant` instead of `uv run --locked mcp-server-qdrant`.
-Some long-running launchers do not inherit the same `uv` environment as an
-interactive shell, while the venv entrypoint is stable after
-`./scripts/local-install.sh`.
+The Hermes helper writes the direct venv entrypoint, not `uv run`, because
+some launchers do not inherit the `uv` environment.
 
-Use the doctor script when something looks down:
+---
 
-```bash
-./scripts/local-doctor.sh
+## Two-stage retrieval pipeline
+
+The recommended search path for quality-focused retrieval:
+
+```
+mode="rerank"  →  hybrid RRF (dense + BM25/BM42) → Qwen3-Reranker-4B → diversity pass → documents
+mode="hybrid"  →  hybrid RRF (dense + BM25/BM42) → documents
+mode="dense"   →  dense HNSW only → documents
 ```
 
-It checks the MCP binary, Qwen3 sidecar, Docker daemon, Qdrant server readiness,
-and Hermes MCP connection.
+**Why two stages?**
 
-Useful local defaults from `scripts/local-env.sh`:
+BM25/BM42 efficiently narrows down exact keyword and concept matches; Qwen3
+dense embeddings capture semantic similarity and paraphrase; RRF fusion
+combines both without score normalisation. The reranker then does a slow but
+very accurate cross-comparison of each candidate against the query, producing
+a final ranked list that dense-only search often misses.
 
-- `QDRANT_MODE=embedded`
-- `QDRANT_LOCAL_PATH=.local/qdrant-storage`
-- `QWEN3_DEVICE=auto`
-- `QWEN3_MAX_LENGTH=1024`
-- `QWEN3_DTYPE=auto`
-- `QWEN3_RESPONSE_LIMIT_BYTES=67108864`
-- `QDRANT_EMBEDDING_BATCH_SIZE=4`
-- `QDRANT_INGEST_CHUNK_SIZE=700`
-- `QDRANT_INGEST_CHUNK_OVERLAP=70`
-- `QDRANT_WRITE_MAX_CONCURRENCY=1`
-- `QDRANT_WRITE_QUEUE_SIZE=8`
+**Candidate pool sizing** (see Calibration section below):
 
-Qwen3 timing and error metrics are written as JSONL to:
-
-```text
-.local/logs/qwen3-embeddings.jsonl
+```
+prefetch_limit = 100   (default with reranker)
+→ fed to Qwen3-Reranker-4B (batches of 4)
+→ diversity pass (max 2 chunks per page/section)
+→ group by document_id
+→ top N documents returned
 ```
 
-This file is intentionally runtime state and should not be committed.
+### Multi-query retrieval (most important quality lever)
 
-Important implementation notes:
+A single rewritten query often compresses out discriminative terms, causing
+the best evidence to never reach the reranker. For a question like "Does
+knowledge increase for students using Socratic circles?" a compressed query
+might drop "Three Columns of Learning", "Enlargement of the Understanding",
+and "maieutic" entirely — those passages exist in the collection but are
+invisible to the retriever.
 
-- Document embeddings are prefixed with `passage: ` before being sent to Qwen3.
-- Multi-vector sidecar JSON responses can exceed asyncio's default line buffer;
-  `QWEN3_RESPONSE_LIMIT_BYTES` keeps larger batches readable.
-- Book-scale ingestion is now upserted incrementally per embedding batch, so a
-  late failure does not discard all earlier successful batches.
-- Password-protected PDFs fail during preflight instead of producing garbage
-  extracted text.
+**The fix**: pass `additional_queries` alongside the primary query. Each
+subquery retrieves its own candidate pool. All pools are merged and
+deduplicated by content hash. The reranker always scores against the
+**primary query**, so rare terms influence ranking even if they only appeared
+in a subquery.
 
-## Launch Modes
-
-There are two supported local launch modes.
-
-| Mode | Qdrant config | Use when |
-| --- | --- | --- |
-| Embedded | `QDRANT_MODE=embedded`, `QDRANT_LOCAL_PATH=.local/qdrant-storage` | One process owns the store, such as only REST or only stdio MCP |
-| Server | `QDRANT_MODE=server`, `QDRANT_URL=http://127.0.0.1:6333` | REST, MCP, and multiple agents need concurrent access |
-
-Embedded Qdrant local mode takes an exclusive lock on its storage directory.
-That is normal Qdrant behavior. If the REST API has `.local/qdrant-storage`
-open, a second stdio MCP process pointed at the same path will fail with a
-storage-lock error. This is why multi-agent launch uses one Qdrant server and
-has every client connect over `QDRANT_URL`.
-
-Qdrant server is safe for concurrent clients, but ingestion still needs
-application-level backpressure. REST and MCP wrap store and ingest writes in a
-bounded local queue. By default each server process runs one embedding/upsert
-job at a time and allows eight waiting jobs:
-
-```bash
-QDRANT_WRITE_MAX_CONCURRENCY=1
-QDRANT_WRITE_QUEUE_SIZE=8
+```python
+search_documents(
+    query="Do students gain knowledge or understanding from Socratic circles?",
+    mode="rerank",
+    additional_queries=[
+        "Adler Three Columns Enlargement of the Understanding maieutic teaching",
+        "critical reading critical thinking vocabulary ownership voice empowerment",
+        "Socratic circles expand student learning idea theme subject curriculum",
+    ],
+    prefetch_limit=40,   # per query; total pool = up to 4 × 40 = ~120 unique
+    rerank_top_k=80,     # how many unique chunks the reranker scores
+)
 ```
 
-This protects local Qwen3 embedding and Qdrant from simultaneous agent dumps.
-Raise the concurrency only after load testing on the target machine. For the
-cleanest multi-agent setup, route agents through one streamable HTTP MCP server
-instead of many stdio MCP processes, so they share one write queue.
+**Guidelines for subquery construction:**
+- Keep the primary query close to the user's original wording — do not compress it
+- Add 2-4 subqueries that preserve rare domain terms, framework names, or author concepts
+- Each subquery should target a distinct evidence bucket (benefits list, framework definition, author's model, etc.)
+- 3-5 total queries is the sweet spot; more than 8 rarely helps and adds latency
 
-Do not mount `.local/qdrant-storage` directly into a Qdrant Docker server.
-Python local-mode storage is not a supported server storage format. To keep
-existing local-mode data, start a Qdrant server and copy collections:
+**Diagnostic test**: if the best evidence chunks don't appear in the candidate
+pool before reranking, the problem is recall — wider queries or more subqueries.
+If they appear but aren't ranked first, the problem is the reranker instruction.
 
-```bash
-./scripts/local-run-qdrant.sh
-uv run --locked python scripts/migrate-local-to-server.py \
-  --source-path .local/qdrant-storage \
-  --target-url http://127.0.0.1:6333
-```
-
-Stop any embedded REST or MCP process before migration so the source path is
-not locked.
+---
 
 ## Running the MCP server
-
-The CLI entry point is:
 
 ```bash
 uv run mcp-server-qdrant
 ```
-
-By default it uses MCP stdio, which is the right transport for clients that
-spawn the server process directly, such as Claude Desktop or LM Studio.
 
 Supported transports:
 
@@ -272,36 +356,25 @@ uv run mcp-server-qdrant --transport streamable-http --host 127.0.0.1 --port 800
 
 `--transport http` is accepted as an alias for `streamable-http`.
 
-By default, local Qdrant storage lives in `storage` under the project root for
-embedded one-process use. Set `QDRANT_LOCAL_PATH` to move it. For concurrent
-multi-agent use, set `QDRANT_URL` instead so the MCP server connects to a
-shared Qdrant server.
+---
 
-## Communicating With MCP
+## Communicating with MCP
 
-There are two common ways to talk to this server as MCP.
-
-### 1. Stdio MCP
-
-Use stdio when the MCP client launches the server process itself:
+### Stdio MCP
 
 ```bash
-./scripts/local-run-mcp.sh
+./scripts/run-server-mcp.sh
+# or:
+QDRANT_MODE=server QDRANT_URL=http://127.0.0.1:6333 uv run --locked mcp-server-qdrant --transport stdio
 ```
 
-Equivalent explicit command:
-
-```bash
-uv run --locked mcp-server-qdrant --transport stdio
-```
-
-Claude Desktop-style configuration for the recommended shared-server path:
+Claude Desktop / Hermes configuration:
 
 ```json
 {
   "mcpServers": {
     "qdrant-enhanced": {
-      "command": "/path/to/mcp-server-qdrant-enhanced/.venv/bin/mcp-server-qdrant",
+      "command": "/path/to/.venv/bin/mcp-server-qdrant",
       "args": [],
       "cwd": "/path/to/mcp-server-qdrant-enhanced",
       "env": {
@@ -309,17 +382,16 @@ Claude Desktop-style configuration for the recommended shared-server path:
         "QDRANT_URL": "http://127.0.0.1:6333",
         "EMBEDDING_PROVIDER": "fastembed",
         "EMBEDDING_MODEL": "Qwen/Qwen3-Embedding-4B",
-        "QWEN3_SIDECAR_PATH": "/path/to/mcp-server-qdrant-enhanced/rust/qwen3_embedder/target/release/qwen3-embedder",
-        "QDRANT_MCP_TOOL_PROFILE": "canonical"
+        "QWEN3_SIDECAR_PATH": "/path/to/rust/qwen3_embedder/target/release/qwen3-embedder",
+        "QDRANT_MCP_TOOL_PROFILE": "canonical",
+        "QDRANT_RERANKER_MODEL": "Qwen/Qwen3-Reranker-4B"
       }
     }
   }
 }
 ```
 
-### 2. Streamable HTTP MCP
-
-Use streamable HTTP when multiple local agents should share one MCP process:
+### Streamable HTTP MCP
 
 ```bash
 QDRANT_MODE=server uv run --locked mcp-server-qdrant \
@@ -334,70 +406,26 @@ If `MCP_HTTP_AUTH_TOKEN` is set, clients must send:
 Authorization: Bearer <token>
 ```
 
-Recommended MCP workflow:
+### Recommended MCP workflow
 
 1. `get_server_capabilities`
 2. `list_embedding_models`
-3. `create_collection`
+3. `create_collection` or `create_hybrid_collection`
 4. `bootstrap_collection_indexes`
 5. `ingest_file` or `ingest_folder`
 6. `search_documents`
 
-Prefer `search_documents` over raw chunk search for normal retrieval.
-
-## Claude Desktop example
-
-Example configuration:
-
-```json
-{
-  "mcpServers": {
-    "qdrant-enhanced": {
-      "command": "/path/to/mcp-server-qdrant-enhanced/.venv/bin/mcp-server-qdrant",
-      "args": [],
-      "cwd": "/path/to/mcp-server-qdrant-enhanced",
-      "env": {
-        "QDRANT_MODE": "server",
-        "QDRANT_URL": "http://127.0.0.1:6333",
-        "EMBEDDING_PROVIDER": "fastembed",
-        "EMBEDDING_MODEL": "Qwen/Qwen3-Embedding-4B",
-        "QDRANT_MCP_TOOL_PROFILE": "canonical"
-      }
-    }
-  }
-}
-```
-
-## HTTP security
-
-For streamable HTTP, the server binds to `127.0.0.1` by default.
-
-Relevant settings:
-
-- `MCP_HOST`: HTTP bind host. Default: `127.0.0.1`.
-- `MCP_PORT`: HTTP bind port. Default: `8000`.
-- `FASTMCP_PORT`: fallback port env var.
-- `MCP_HTTP_AUTH_TOKEN`: optional bearer token required on HTTP requests.
-- `MCP_HTTP_ALLOWED_ORIGINS`: comma-separated allowed origins for origin checks.
-
-Use loopback binding for local desktop use.
+---
 
 ## Running the REST API
-
-The FastAPI entry point mirrors the same Qdrant connector and ingestion
-pipeline:
 
 ```bash
 uv run mcp-server-qdrant-webui --host 127.0.0.1 --port 8765
 ```
 
-OpenAPI docs are available at:
+OpenAPI docs: `http://127.0.0.1:8765/docs`
 
-```text
-http://127.0.0.1:8765/docs
-```
-
-REST endpoints include:
+REST endpoints:
 
 - `GET /health`
 - `GET /collections`
@@ -415,67 +443,170 @@ REST endpoints include:
 - `GET /embedding_models`
 - `POST /embedding_models/active`
 
-### REST Examples
-
-Health:
+### REST examples
 
 ```bash
+# Health
 curl http://127.0.0.1:8765/health
-```
 
-Create a Qwen3 4B collection:
-
-```bash
+# Create a Qwen3-4B collection
 curl -X POST http://127.0.0.1:8765/collections \
   -H 'Content-Type: application/json' \
-  --data '{"collection_name":"my_docs_qwen3_4b","embedding_model":"Qwen/Qwen3-Embedding-4B","distance":"cosine"}'
-```
+  --data '{"collection_name":"my_docs","embedding_model":"Qwen/Qwen3-Embedding-4B","distance":"cosine"}'
 
-Switch the active REST embedding provider:
-
-```bash
-curl -X POST http://127.0.0.1:8765/embedding_models/active \
-  -H 'Content-Type: application/json' \
-  --data '{"model_name":"Qwen/Qwen3-Embedding-4B"}'
-```
-
-Ingest a PDF:
-
-```bash
+# Ingest a PDF
 curl -X POST http://127.0.0.1:8765/ingest/file \
   -H 'Content-Type: application/json' \
-  --data '{"file_path":"/absolute/path/to/book.pdf","collection_name":"my_docs_qwen3_4b"}'
-```
+  --data '{"file_path":"/absolute/path/to/book.pdf","collection_name":"my_docs"}'
 
-Search by distinct document:
-
-```bash
+# Two-stage rerank search
 curl -X POST http://127.0.0.1:8765/search_documents \
   -H 'Content-Type: application/json' \
-  --data '{"query":"What is the main argument?","collection_name":"my_docs_qwen3_4b","limit":5,"chunks_per_document":4}'
+  --data '{
+    "query": "What is the main argument?",
+    "collection_name": "my_docs",
+    "limit": 5,
+    "chunks_per_document": 4,
+    "mode": "rerank"
+  }'
 ```
+
+---
+
+## Calibration and performance tuning
+
+These settings directly control retrieval quality. Start from the default
+pipeline and tune one variable at a time, measuring whether the right evidence
+chunks appear in the candidate set *before* reranking, not just in the final
+answer.
+
+### Retrieval quality knobs
+
+| Env var | Default | Effect |
+| --- | --- | --- |
+| `QDRANT_SPARSE_MODEL` | `Qdrant/bm25` | `Qdrant/bm42-all-minilm-l6-v2-attentions` for neural BM25 |
+| `QDRANT_RERANKER_MODEL` | `Xenova/ms-marco-MiniLM-L-6-v2` | `Qwen/Qwen3-Reranker-4B` for quality |
+| `QDRANT_RERANKER_INSTRUCTION` | (generic web-search default) | Domain-specific instruction for Qwen3 |
+| `QDRANT_RERANK_PREFETCH_LIMIT` | 0 (auto: 100 with reranker) | Raise to 120–150 for better recall |
+| `QDRANT_RERANK_TOP_K` | 0 (all prefetched) | Limit to 60–80 to speed up Qwen3 reranking |
+| `QDRANT_INGEST_CHUNK_SIZE` | 700 | Lower to 350–500 for denser retrieval chunks |
+| `QDRANT_INGEST_CHUNK_OVERLAP` | 70 | Raise to 100–150 with smaller chunks |
+| `QDRANT_EMBEDDING_BATCH_SIZE` | 4 | Batch size for embedding during ingestion |
+
+### Recommended A/B progression for book-scale PDFs
+
+Start here and work upward:
+
+```
+1. dense only                                              (baseline)
+2. dense + BM25                                            (+hybrid)
+3. dense + BM25 + MiniLM reranker                          (+fast rerank)
+4. dense + BM25 + Qwen3-Reranker-4B                        (+quality rerank)
+5. dense + BM25 + Qwen3-Reranker-4B + multi-query          (+recall)
+6. dense + BM42 + Qwen3-Reranker-4B + multi-query          (A/B BM25 vs BM42)
+```
+
+**Diagnostic approach**: before measuring answer quality, verify that the gold
+evidence chunks appear in the candidate pool before reranking. If they don't,
+the problem is retrieval recall — add multi-query subqueries or widen
+`prefetch_limit`. If they appear but rank poorly, the problem is the reranker
+instruction. Only if both are good should you blame the generation prompt.
+
+### Qwen3 reranker instruction tuning
+
+Custom instructions improve ranking by 1–5% when tailored to the task. The
+model card instruction format is:
+
+```
+<Instruct>: {instruction}
+<Query>: {query}
+<Document>: {chunk}
+```
+
+For **book and document Q&A**, try:
+
+```bash
+QDRANT_RERANKER_INSTRUCTION="Retrieve passages that directly answer the question using explicit claims, definitions, or quoted evidence from the document."
+```
+
+For **scholarly / analytical retrieval**:
+
+```bash
+QDRANT_RERANKER_INSTRUCTION="Prefer passages that provide primary textual evidence. For conceptual questions, rank higher when the passage explains relationships between concepts, not just mentions keywords."
+```
+
+Per-request override via MCP `search_documents(reranker_instruction="...")` or
+via the REST `search_documents` body.
+
+### BM25 vs BM42
+
+`Qdrant/bm25` is pure-algorithmic (no download, always available). For books
+and PDFs, classic BM25 handles named concepts like proper nouns and chapter
+headings extremely well. `Qdrant/bm42-all-minilm-l6-v2-attentions` uses
+attention weights to improve IDF scoring; it adds ~22 MB download and can help
+on shorter, keyword-dense queries. A/B test on your specific collection before
+switching.
+
+Switch globally:
+
+```bash
+QDRANT_SPARSE_MODEL='Qdrant/bm42-all-minilm-l6-v2-attentions' ./scripts/local-run-webui.sh
+```
+
+Override per hybrid-collection creation:
+
+```python
+create_hybrid_collection(collection_name="...", sparse_model="Qdrant/bm42-all-minilm-l6-v2-attentions")
+```
+
+### Candidate pool sizing for Qwen3-Reranker-4B
+
+On Apple Silicon MPS with batch_size=4, Qwen3-Reranker-4B processes ~0.5–1s
+per batch. Scaling estimates:
+
+| prefetch_limit | Reranker batches | Approx. MPS time |
+| ---: | ---: | --- |
+| 60 | 15 | ~8–15s |
+| 100 | 25 | ~13–25s |
+| 150 | 38 | ~20–38s |
+
+For interactive use, 60–80 with `rerank_top_k=60` balances quality and
+latency. For offline or batch work, 100–150 with no top-k limit is worth the
+wait.
+
+```bash
+QDRANT_RERANK_PREFETCH_LIMIT=120
+QDRANT_RERANK_TOP_K=80
+```
+
+### Diversity pass
+
+After reranking, the server applies a section-diversity pass that limits chunks
+to `max_per_section=2` from the same page/section. This prevents five
+near-identical chunks from a single dense passage dominating the answer context.
+It is always on when `mode="rerank"` and is not configurable per-request (the
+default is good for almost all cases).
+
+### Chunking
+
+Default: 700 character target, 70 overlap, paragraph-aware.
+
+For better retrieval precision on book-length PDFs:
+
+```bash
+QDRANT_INGEST_CHUNK_SIZE=400
+QDRANT_INGEST_CHUNK_OVERLAP=100
+```
+
+Smaller chunks improve precision but mean more chunks per document and slightly
+slower ingestion. You will need to re-ingest into a new collection after
+changing chunk size.
+
+---
 
 ## MCP tool profiles
 
-The server has a profile gate so clients can expose a smaller or larger tool
-surface. Configure it with:
-
-```bash
-QDRANT_MCP_TOOL_PROFILE=minimal
-QDRANT_MCP_TOOL_PROFILE=canonical
-QDRANT_MCP_TOOL_PROFILE=full
-```
-
-The default is `canonical`.
-
-Profile intent:
-
-- `minimal`: daily ingestion, document search, model listing, collection info.
-- `canonical`: minimal plus collection creation, hybrid setup, index bootstrap,
-  and active embedding model switching.
-- `full`: canonical plus raw chunk-level storage/search/admin tools.
-
-Configured profile mapping:
+Set with `QDRANT_MCP_TOOL_PROFILE` (default: `canonical`).
 
 | Tool | Minimal | Canonical | Full |
 | --- | --- | --- | --- |
@@ -501,346 +632,149 @@ Configured profile mapping:
 | `scroll_collection` | no | no | yes |
 | `hybrid_search` | no | no | yes |
 
+---
+
 ## Main MCP tools
 
-### Document search
+### `search_documents`
 
-`search_documents` is the preferred search tool.
-
-It overfetches raw chunk hits, groups them by `metadata.document_id`, and
-returns distinct documents ranked by their best representative chunks.
-
-Arguments:
-
-- `query`: semantic search query.
-- `collection_name`: collection to search.
-- `limit`: number of distinct documents to return. Default: `10`.
-- `chunks_per_document`: number of best chunks to include per document.
-  Default: `4`.
-- `filter`: optional high-level filter object.
-- `mode`: `dense`, `hybrid`, `rerank`, or `late_interaction`.
-- `reranker_model`: optional reranker for `mode="rerank"`.
-- `late_interaction_model`: optional model for `mode="late_interaction"`.
-
-Search modes:
-
-- `dense`: dense vector search with the active FastEmbed model.
-- `hybrid`: dense + sparse BM25 search fused with reciprocal rank fusion.
-- `rerank`: hybrid first stage followed by a cross-encoder reranker.
-- `late_interaction`: ColBERT-style multivector retrieval using Qdrant MaxSim.
-  Create or ingest into a late-interaction collection first.
-
-### File ingestion
-
-`ingest_file` extracts text from one file, captures metadata, chunks the text,
-and stores all chunks in Qdrant.
+Document-level grouped search. Overfetches raw chunks, optionally reranks,
+applies diversity, groups by `metadata.document_id`, and returns distinct
+documents with their best chunks.
 
 Arguments:
 
-- `file_path`: absolute path.
-- `collection_name`: target collection; defaults to `documents`.
-- `extra_metadata`: optional JSON string merged into every chunk.
-- `mode`: `dense`, `hybrid`, or `late_interaction`.
-- `embedding_model`: optional dense embedding model override.
-- `late_interaction_model`: optional late-interaction model override.
+| Argument | Type | Default | Notes |
+| --- | --- | --- | --- |
+| `query` | str | required | Primary query — used for retrieval **and** reranking |
+| `collection_name` | str | configured default | Target collection |
+| `limit` | int | 10 | Distinct documents to return |
+| `chunks_per_document` | int | 4 | Best chunks to include per doc |
+| `filter` | dict | None | High-level filter object |
+| `mode` | str | `"dense"` | `dense`, `hybrid`, `rerank`, `late_interaction` |
+| `additional_queries` | list[str] | None | Extra retrieval queries; pools merged + deduped; reranking always uses primary query |
+| `reranker_model` | str | `QDRANT_RERANKER_MODEL` | Override per-request |
+| `reranker_instruction` | str | `QDRANT_RERANKER_INSTRUCTION` | Qwen3 task instruction override |
+| `prefetch_limit` | int | auto (100 with reranker) | Raw candidate pool size per query |
+| `rerank_top_k` | int | all prefetched | Max unique candidates scored by reranker |
+| `embedding_model` | str | collection/server default | Per-request dense model override |
+| `late_interaction_model` | str | `colbert-ir/colbertv2.0` | ColBERT model |
 
-`ingest_folder` recursively ingests supported files from a directory.
+### `ingest_file` / `ingest_folder`
 
-Arguments:
-
-- `folder_path`: absolute path.
-- `collection_name`: target collection; defaults to `documents`.
-- `recursive`: default `true`.
-- `skip_hidden`: default `true`.
-- `extra_metadata`: optional JSON string merged into every file.
-- `mode`: `dense`, `hybrid`, or `late_interaction`.
-- `embedding_model`: optional dense embedding model override.
-- `late_interaction_model`: optional late-interaction model override.
-- `run_mode`: `apply` or `report`.
-- `plan_id`: optional report/apply plan id.
+Extract text, capture macOS metadata, chunk, embed (dense + sparse), and store
+in Qdrant. Supports `mode="dense"`, `"hybrid"`, `"late_interaction"` and an
+optional `embedding_model` override.
 
 Supported file types:
 
 | Extension | Extractor |
 | --- | --- |
-| `.txt`, `.log`, `.rst`, `.conf`, `.ini`, `.env` | direct text read with charset fallback |
-| `.md`, `.markdown` | direct text read, YAML/TOML frontmatter stripped |
-| `.json`, `.jsonl` | parsed and rendered as searchable path/value text |
-| `.csv`, `.tsv` | parsed and rendered as row/column text |
-| `.yaml`, `.yml`, `.toml`, `.xml`, `.html`, `.htm` | direct text read with charset fallback |
-| common code/script extensions | direct text read with charset fallback |
-| `.pdf` | preflight scan, then `pdfminer.six`, with `pypdf` fallback |
-| `.docx` | `python-docx`, including paragraphs and tables |
-
-Chunking is paragraph-aware with a default target size of 700 characters and
-70 characters of overlap. Tune with `QDRANT_INGEST_CHUNK_SIZE` and
-`QDRANT_INGEST_CHUNK_OVERLAP`.
-
-### Ingestion bottlenecks
-
-Foreseeable ingestion bottlenecks:
-
-- **PDF extraction:** `pdfminer.six` is CPU-heavy on large or structurally
-  complex PDFs. The server now runs a cheap PDF preflight first, sampling a few
-  pages for embedded text/images before full extraction.
-- **OCR-less scanned PDFs:** OCR is not implemented. If preflight sees image
-  resources but no extractable text in the sampled pages, the file is treated as
-  probably scanned and full PDF text extraction is skipped. Ingest returns an
-  extraction failure saying OCR is needed.
-- **Password-protected PDFs:** encrypted PDFs that require a password fail
-  during preflight. They are not extracted or embedded, because extractors can
-  otherwise produce garbage-looking text that hurts retrieval quality.
-- **Embedding throughput:** FastEmbed is batched, but dense, hybrid, and
-  late-interaction modes still spend most ingestion time in embedding for large
-  folders. On this local Apple Silicon setup, Qwen3 4B is the practical
-  book-scale default; Qwen3 8B is much slower.
-- **Late-interaction storage:** ColBERT-style multivectors store many vectors
-  per chunk, so ingestion is slower and storage use is higher than dense mode.
-- **Chunking quality:** current chunking is paragraph-aware with fixed
-  character overlap. It is predictable and cheap, but code, tables, and
-  structured files may benefit from format-aware chunking later.
-- **macOS metadata:** Spotlight/Finder metadata collection runs in bounded async
-  subprocesses. Raising `QDRANT_METADATA_MAX_PROCS` can increase throughput but
-  may make folder ingest noisier on the machine.
-- **Qdrant writes and indexes:** large folders pay for vector upsert and payload
-  indexes. Running `bootstrap_collection_indexes` before bulk ingest avoids
-  creating metadata indexes late.
-- **Sidecar JSON response size:** large embedding batches return large JSON
-  lines. `QWEN3_RESPONSE_LIMIT_BYTES` raises the asyncio subprocess read limit
-  so multi-vector responses do not fail at the pipe boundary.
+| `.txt`, `.log`, `.rst`, `.conf`, `.ini`, `.env` | direct text with charset fallback |
+| `.md`, `.markdown` | text, YAML/TOML frontmatter stripped |
+| `.json`, `.jsonl` | parsed to searchable path/value text |
+| `.csv`, `.tsv` | row/column text |
+| `.yaml`, `.yml`, `.toml`, `.xml`, `.html` | direct text |
+| code/script extensions | direct text |
+| `.pdf` | preflight scan → pdfminer.six → pypdf fallback |
+| `.docx` | python-docx (paragraphs + tables) |
 
 ### Collection tools
 
-`list_collections` lists available Qdrant collections.
+`create_collection` — dense-vector collection from an embedding model.
 
-`get_collection_info` returns point/vector counts, status, vector size, and
-distance metric.
+`create_hybrid_collection` — dense + BM25/BM42 sparse slots for hybrid search.
+Use the `sparse_model` argument to select `Qdrant/bm25` (default) or
+`Qdrant/bm42-all-minilm-l6-v2-attentions`.
 
-`create_collection` creates a dense-vector collection from an embedding model.
-The vector size is inferred from the model unless `vector_size` is provided.
+`bootstrap_collection_indexes` — creates payload indexes for standard macOS
+metadata fields (run before bulk ingestion).
 
-`create_hybrid_collection` creates a collection with:
-
-- One dense vector slot using the selected FastEmbed model.
-- One sparse vector slot using `Qdrant/bm25` by default.
-
-`create_late_interaction_collection` creates a Qdrant multivector collection
-for ColBERT-style MaxSim retrieval. The default late-interaction model is
-`colbert-ir/colbertv2.0`, and `search_documents(mode="late_interaction")`
-queries the multivector field.
-
-`bootstrap_collection_indexes` creates payload indexes for the standard macOS
-metadata fields.
-
-`delete_collection` is only exposed in the `full` profile and requires
-`confirm=true`.
+`delete_collection` — `full` profile only, requires `confirm=true`.
 
 ### Embedding model tools
 
-`list_embedding_models` asks FastEmbed for supported dense models and appends
-supplemental Qwen3 entries. FastEmbed-reported BGE v1.5 models are selectable
-when they appear in that list; BGE-M3 is not currently an implemented provider
-path in this project.
+`list_embedding_models` returns FastEmbed models plus supplemental Qwen3
+entries. `set_collection_embedding_model` switches the active provider for
+a collection (persisted to `collection_models.json`). Changing the model
+does not re-embed existing vectors; create a new collection to switch.
 
-The supplemental Qwen3 entries are:
+---
 
-- `Qwen/Qwen3-Embedding-0.6B` — 1024 dimensions
-- `Qwen/Qwen3-Embedding-4B` — 2560 dimensions
-- `Qwen/Qwen3-Embedding-8B` — 4096 dimensions
+## File ingestion bottlenecks
 
-`set_collection_embedding_model` switches the active provider for subsequent
-store and search operations for that collection. Assignments are persisted to
-`<storage>/collection_models.json` and reloaded on server startup.
+- **PDF extraction**: `pdfminer.six` is CPU-heavy on complex PDFs; a cheap
+  preflight samples a few pages first.
+- **Scanned PDFs**: OCR is not implemented; image-only PDFs fail with an
+  OCR-needed message.
+- **Password-protected PDFs**: fail at preflight with a clear error; they
+  previously produced garbage embeddings.
+- **Embedding throughput**: Qwen3-4B is 2.5–4s per 4-chunk batch after warmup.
+  Qwen3-8B is ~55–70s per 4 chunks.
+- **Late-interaction storage**: ColBERT multivectors are much larger than dense.
+- **Write queue**: REST and MCP wrap store/ingest in a bounded queue
+  (`QDRANT_WRITE_MAX_CONCURRENCY=1`, `QDRANT_WRITE_QUEUE_SIZE=8`).
 
-Changing the active model does not re-embed existing vectors. If a collection
-was created with Qwen3 4B vectors, use a new BGE collection and re-ingest the
-documents before searching with a BGE model.
-
-### Raw tools
-
-The `full` profile exposes raw chunk-level tools:
-
-- `qdrant_store`
-- `qdrant_find`
-- `qdrant_store_batch`
-- `scroll_collection`
-- `hybrid_search`
-
-These are useful for diagnostics and low-level manipulation, but
-`search_documents` and the ingestion tools are the preferred high-level path.
-`qdrant_find` is retained for compatibility and resolves embedding providers
-per request, but new clients should prefer `search_documents`.
+---
 
 ## Structured outputs
 
-Priority tools return the versioned `{contract, data, observability}` envelope
-and advertise MCP `outputSchema` metadata in `tools/list`. The schemas are
-defined in `src/mcp_server_qdrant/mcp_runtime/schemas.py` and attached during
-tool registration.
+Priority tools return the versioned `{contract, data, observability}` envelope:
+
+```json
+{
+  "contract": { "contract_version": "1.0", "toolset_version": "0.8.0", "profile": "canonical" },
+  "data": {},
+  "observability": { "duration_ms": 12, "warnings": [], "stats": {} }
+}
+```
+
+Failures use `error` instead of `data`:
+
+```json
+{
+  "contract": { ... },
+  "error": { "code": "invalid_argument", "message": "...", "retryable": false },
+  "observability": { ... }
+}
+```
+
+---
 
 ## Discovery tools
 
-Five read-only self-description tools let an agent inspect the server before
-acting. All five live in the `minimal` profile and return the structured
-envelope.
+Five read-only tools let an agent inspect the server before acting. All live in
+the `minimal` profile and return the structured envelope.
 
 | Tool | Returns |
 | --- | --- |
 | `get_server_capabilities` | transports, profiles, search modes, extraction formats, feature flags |
-| `get_indexed_fields` | filterable payload fields with types, allowed operators, role, and the high-level filter grammar |
+| `get_indexed_fields` | filterable payload fields, types, operators, filter grammar |
 | `get_supported_extractors` | per-extension extractor stack and chunking strategy |
-| `list_search_modes` | `dense`, `hybrid`, `rerank`, `late_interaction` with when-to-use guidance |
-| `get_collection_schema` | per-collection vector config, distance metric, point counts, status |
+| `list_search_modes` | `dense`, `hybrid`, `rerank`, `late_interaction` with guidance |
+| `get_collection_schema` | per-collection vector config, distance, point counts |
 
-These payloads are static where possible (no per-request work) so calling
-them cheaply is fine.
+---
 
 ## Report/apply gating
 
-Mutating or expensive tools support a two-step pattern:
+Mutating tools support a two-step pattern to prevent accidents:
 
-1. Call with `mode="report"` (or `run_mode="report"` for `ingest_folder`) to
-   preview the action. The server returns a `plan_id` with a 10-minute TTL plus
-   a description of what would happen.
-2. Call again with `mode="apply"` and `plan_id=<id>` to execute. The plan_id
-   is single-use, scoped to the originating tool, and validated against the
-   request target before execution.
+1. Call with `mode="report"` — returns a `plan_id` (10-minute TTL) and a
+   description of what would happen.
+2. Call with `mode="apply"` and `plan_id=<id>` — executes. Plan IDs are
+   single-use and scoped to the originating tool.
 
-| Tool | Report payload includes |
+| Tool | Report payload |
 | --- | --- |
-| `delete_collection` | target collection, existence, vector config, point count, destructive warning |
-| `ingest_folder` | candidate file count, extension breakdown, sample paths, warnings |
+| `delete_collection` | target, existence, vector config, point count, destructive warning |
+| `ingest_folder` | candidate file count, extension breakdown, sample paths |
 
-`bootstrap_collection_indexes` is idempotent and not gated. Direct `apply`
-without first running `report` is allowed for low-risk cases (e.g. running
-`ingest_folder` once you already trust the inputs); strict gating can be
-enforced by your client by requiring a fresh plan_id.
-
-## Multi-agent safety
-
-The server is designed for multiple AI agents sharing one running process
-over Streamable HTTP. The relevant guarantees:
-
-- Embedding providers are resolved per request, not held as a single mutable
-  global. `set_collection_embedding_model` records a per-collection assignment
-  in the resolver and does not affect other clients targeting other collections.
-- Provider instances are cached by `(provider_type, model_name)` so re-using a
-  model across requests is fast, but no cached entry is mutated after creation.
-- The plan registry is process-local, namespaced by tool, with TTL eviction
-  and single-use semantics.
-- HTTP transport binds to `127.0.0.1` by default, validates the `Origin`
-  header against an allowlist, and supports an optional Bearer token via
-  `MCP_HTTP_AUTH_TOKEN`.
-
-If you discover a request path that mutates shared state, please open an
-issue — the auditing intent is that no client can change behavior another
-client observes.
-
-## Recommended workflows
-
-### Safe setup
-1. `get_server_capabilities` — confirm transport and feature set
-2. `list_embedding_models` — pick a dense model
-3. `create_collection` *or* `create_hybrid_collection` for hybrid retrieval
-4. `bootstrap_collection_indexes` — pre-create payload indexes
-5. `ingest_folder` (optionally with `run_mode="report"` first)
-6. `search_documents` to verify the corpus
-
-### Safe search
-1. `get_indexed_fields` — inspect the filter grammar and available fields
-2. `search_documents(mode="dense" | "hybrid" | "rerank", filter=...)`
-3. Refine filters / re-search until satisfied
-
-### Safe mutation
-1. `delete_collection(collection_name="x", mode="report")` → returns plan_id
-2. Inspect the plan payload; confirm the target and warnings
-3. `delete_collection(collection_name="x", mode="apply", plan_id="plan_xyz")`
-
-## Response envelope
-
-Priority tools return a versioned JSON envelope:
-
-```json
-{
-  "contract": {
-    "contract_version": "1.0",
-    "toolset_version": "0.8.0",
-    "profile": "canonical"
-  },
-  "data": {},
-  "observability": {
-    "duration_ms": 12,
-    "warnings": [],
-    "stats": {}
-  }
-}
-```
-
-Failures use the same outer structure with `error` instead of `data`:
-
-```json
-{
-  "contract": {
-    "contract_version": "1.0",
-    "toolset_version": "0.8.0",
-    "profile": "canonical"
-  },
-  "error": {
-    "code": "invalid_argument",
-    "message": "Unsupported search mode",
-    "retryable": false
-  },
-  "observability": {
-    "duration_ms": 4,
-    "warnings": [],
-    "stats": {}
-  }
-}
-```
-
-Some legacy/raw tools still return strings or lists of strings.
-
-## macOS metadata
-
-During file ingestion, the server reads filesystem metadata, Spotlight metadata
-via `mdls`, and Finder tags via extended attributes when available.
-
-Common metadata fields:
-
-| Field | Description |
-| --- | --- |
-| `metadata.document_id` | stable SHA-1-based file identifier |
-| `metadata.path` | absolute source path |
-| `metadata.parent_path` | parent folder |
-| `metadata.filename` | filename with extension |
-| `metadata.extension` | lowercase extension without dot |
-| `metadata.size_bytes` | file size |
-| `metadata.is_hidden` | dotfile/hidden flag |
-| `metadata.has_text` | extraction produced text |
-| `metadata.content_type` | Spotlight content type |
-| `metadata.title` | Spotlight title |
-| `metadata.tags` | Finder/Spotlight tags |
-| `metadata.authors` | Spotlight authors |
-| `metadata.keywords` | Spotlight keywords |
-| `metadata.comment` | Spotlight comment |
-| `metadata.source_urls` | Spotlight where-from URLs |
-| `metadata.created_at` | ISO timestamp |
-| `metadata.modified_at` | ISO timestamp |
-| `metadata.last_opened_at` | ISO timestamp |
-| `metadata.page_count` | page count when available |
-| `metadata.extractor_used` | extraction backend |
-| `metadata.char_count` | extracted character count |
-| `metadata.ingested_at` | ingestion timestamp |
-| `metadata.chunk_index` | chunk number within document |
-| `metadata.total_chunks` | total chunks for document |
-
-The index bootstrap path creates Qdrant payload indexes for the common
-filterable fields.
+---
 
 ## Filter grammar
 
-`search_documents` and the REST search endpoints accept a high-level filter
-shape:
+`search_documents` and REST search accept a high-level filter shape:
 
 ```json
 {
@@ -857,225 +791,169 @@ shape:
 }
 ```
 
-Operators:
+Operators: `==`, `!=`, `>`, `>=`, `<`, `<=`, `any`, `except`. Field names are
+auto-prefixed with `metadata.` unless they already contain a dot.
 
-- `==`
-- `!=`
-- `>`
-- `>=`
-- `<`
-- `<=`
-- `any`
-- `except`
+---
 
-Field names are automatically prefixed with `metadata.` unless they already
-contain a dot. ISO date strings are compiled to Qdrant datetime ranges for
-range operators.
+## macOS metadata
 
-For strict exclusion on array fields, prefer `must_not` with `any`.
+During ingestion, the server reads filesystem metadata, Spotlight (`mdls`), and
+Finder tags (extended attributes).
 
-## Embedding models
+| Field | Description |
+| --- | --- |
+| `metadata.document_id` | stable SHA-1-based file identifier |
+| `metadata.path` | absolute source path |
+| `metadata.filename` | filename with extension |
+| `metadata.extension` | lowercase extension without dot |
+| `metadata.size_bytes` | file size |
+| `metadata.content_type` | Spotlight content type |
+| `metadata.title` | Spotlight title |
+| `metadata.tags` | Finder/Spotlight tags |
+| `metadata.authors` | Spotlight authors |
+| `metadata.page_count` | page count when available |
+| `metadata.chunk_index` | chunk number within document |
+| `metadata.total_chunks` | total chunks for document |
+| `metadata.ingested_at` | ingestion timestamp |
 
-The implemented dense provider path is FastEmbed, with a local Qwen3 sidecar
-for the supplemental Qwen3 model names listed below. The test suite also
-contains an optional FlagEmbedding/BGE smoke test; it skips automatically unless
-`FlagEmbedding` is installed.
+---
 
-Default model:
+## Multi-agent safety
 
-```text
-sentence-transformers/all-MiniLM-L6-v2
-```
+- Embedding providers are resolved per request, not held as a single global.
+- Provider instances are cached by `(provider_type, model_name)` — no mutation
+  after creation.
+- The plan registry is process-local, namespaced by tool, with TTL eviction.
+- HTTP transport binds to `127.0.0.1` by default, validates the `Origin`
+  header, and supports an optional Bearer token.
 
-Supplemental model entries added by this project:
+---
 
-| Model | Dimensions | Notes |
-| --- | ---: | --- |
-| `Qwen/Qwen3-Embedding-0.6B` | 1024 | lightweight Qwen3 embedding model |
-| `Qwen/Qwen3-Embedding-4B` | 2560 | practical local book-scale default on Apple Silicon |
-| `Qwen/Qwen3-Embedding-8B` | 4096 | larger multilingual/code retrieval model |
+## Configuration reference
 
-The server also lists models reported by `fastembed.TextEmbedding`.
+### Core
 
-### BGE status
+| Variable | Default (local scripts) | Meaning |
+| --- | --- | --- |
+| `QDRANT_MODE` | `embedded` | `embedded`, `server`, or `docker` |
+| `QDRANT_URL` | `http://127.0.0.1:6333` (server/docker mode) | External Qdrant URL |
+| `QDRANT_API_KEY` | unset | Qdrant API key |
+| `QDRANT_LOCAL_PATH` | `.local/qdrant-storage` (embedded) | Embedded storage path |
+| `QDRANT_DOCKER_STORAGE_PATH` | `.local/qdrant-server-storage` | Docker volume path |
+| `QDRANT_IMAGE` | `qdrant/qdrant:v1.17.1` | Docker image, pinned to client minor version |
+| `COLLECTION_NAME` | `documents` | Default collection |
 
-BGE v1.5 models reported by FastEmbed are selectable, for example:
-
-- `BAAI/bge-small-en`
-- `BAAI/bge-small-en-v1.5`
-- `BAAI/bge-base-en`
-- `BAAI/bge-base-en-v1.5`
-- `BAAI/bge-large-en-v1.5`
-- `BAAI/bge-small-zh-v1.5`
-
-They are not active for a collection unless that collection is created or
-assigned with a BGE model and the source documents are embedded with that same
-model. Existing Qwen3 collections keep their Qwen3 vector names and dimensions.
-
-`BAAI/bge-m3` is not currently listed by the installed FastEmbed registry, and
-the optional FlagEmbedding smoke test is not a production provider integration.
-Use FlagEmbedding directly, or add a dedicated provider implementation, before
-promising BGE-M3 retrieval.
-
-Optional compatibility smoke:
-
-```bash
-uv pip install FlagEmbedding
-uv run --locked pytest tests/test_flagembedding_optional.py
-```
-
-That test checks `BAAI/bge-base-en-v1.5` through `FlagEmbedding.FlagModel` and
-expects a 768-dimensional vector. It is intentionally not a required provider
-path yet.
-
-Important: collection vector dimensions must match the model used to store and
-search data. Create a new collection when switching to a model with a different
-dimension.
-
-FastEmbed runs on CPU by default. Set `EMBEDDING_DEVICE` to another device
-supported by the installed FastEmbed/ONNX runtime, such as `cuda` or `mps`, to
-use local acceleration when available.
-
-Batch storage paths call FastEmbed with document batches, so embedding
-computation is batched for `batch_store`, `ingest_file`, and `ingest_folder`.
-Repeated high-level metadata filters are compiled through a small in-process
-cache before being sent to Qdrant.
-
-## Configuration
-
-Core environment variables:
+### Embedding
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `QDRANT_MODE` | `embedded` in local scripts | `embedded`, `server`, or `docker` helper mode |
-| `QDRANT_URL` | unset, or `http://127.0.0.1:6333` in server/docker local scripts | External Qdrant server URL |
-| `QDRANT_API_KEY` | unset | Qdrant API key |
-| `QDRANT_LOCAL_PATH` | `<repo>/storage`, or `.local/qdrant-storage` in embedded local scripts | Embedded local-mode storage path; leave unset when `QDRANT_URL` is set |
-| `QDRANT_DOCKER_STORAGE_PATH` | `.local/qdrant-server-storage` in docker local scripts | Qdrant server Docker volume path |
-| `QDRANT_IMAGE` | `qdrant/qdrant:v1.17.1` | Local Docker server image, pinned to match the Python client minor version |
-| `COLLECTION_NAME` | `documents` | Optional default collection |
 | `EMBEDDING_PROVIDER` | `fastembed` | Embedding provider type |
 | `EMBEDDING_MODEL` | `Qwen/Qwen3-Embedding-8B` | Active dense embedding model |
-| `EMBEDDING_DEVICE` | `auto` | FastEmbed/Qwen3 device, e.g. `auto`, `cpu`, `cuda`, `mps`, or `metal` when supported |
-| `QWEN3_SIDECAR_PATH` | auto-detected | Optional Rust Qwen3 sidecar binary path |
-| `QWEN3_RESPONSE_LIMIT_BYTES` | `67108864` in local scripts | Async stdout read limit for large Qwen3 sidecar responses |
-| `QWEN3_METRICS_PATH` | `.local/logs/qwen3-embeddings.jsonl` in local scripts | Optional JSONL timing/error metrics path |
-| `QDRANT_EMBEDDING_BATCH_SIZE` | `4` | Embedding/upsert batch size for batch storage and ingestion |
-| `QDRANT_INGEST_CHUNK_SIZE` | `700` in local scripts | Target ingest chunk size in characters |
-| `QDRANT_INGEST_CHUNK_OVERLAP` | `70` in local scripts | Chunk overlap in characters |
-| `QDRANT_WRITE_MAX_CONCURRENCY` | `1` | Concurrent embedding/upsert write jobs per server process |
-| `QDRANT_WRITE_QUEUE_SIZE` | `8` | Waiting write jobs before new writes return a queue-full error |
+| `EMBEDDING_DEVICE` | `auto` | Device for FastEmbed / Qwen3 |
+| `QWEN3_SIDECAR_PATH` | auto-detected | Rust Qwen3 sidecar binary path |
+| `QWEN3_RESPONSE_LIMIT_BYTES` | `67108864` | Async stdout limit for Qwen3 sidecar |
+| `QWEN3_METRICS_PATH` | `.local/logs/qwen3-embeddings.jsonl` | JSONL timing metrics |
+| `QWEN3_MAX_LENGTH` | `1024` | Qwen3 token limit |
+| `QWEN3_DTYPE` | `auto` | Qwen3 dtype (f32/f16/bf16/auto) |
+
+### Retrieval quality
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `QDRANT_SPARSE_MODEL` | `Qdrant/bm25` | Sparse model: `bm25` or `bm42-all-minilm-l6-v2-attentions` |
+| `QDRANT_RERANKER_MODEL` | `Xenova/ms-marco-MiniLM-L-6-v2` | Default reranker |
+| `QDRANT_RERANKER_INSTRUCTION` | unset (generic default) | Qwen3 task instruction |
+| `QDRANT_RERANK_PREFETCH_LIMIT` | `0` (auto) | Candidate pool size; 0 = auto |
+| `QDRANT_RERANK_TOP_K` | `0` (all) | Max candidates scored by reranker |
+
+### Ingestion
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `QDRANT_EMBEDDING_BATCH_SIZE` | `4` | Embedding/upsert batch size |
+| `QDRANT_INGEST_CHUNK_SIZE` | `700` | Target chunk size in characters |
+| `QDRANT_INGEST_CHUNK_OVERLAP` | `70` | Chunk overlap in characters |
+| `QDRANT_WRITE_MAX_CONCURRENCY` | `1` | Concurrent write jobs per process |
+| `QDRANT_WRITE_QUEUE_SIZE` | `8` | Waiting write jobs before queue-full error |
+| `QDRANT_METADATA_MAX_PROCS` | `8` | Max concurrent macOS metadata subprocesses |
+
+### Search behaviour
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
 | `QDRANT_SEARCH_LIMIT` | `50` | Default limit for raw find |
-| `QDRANT_READ_ONLY` | `false` | Hide mutation tools when true |
+| `QDRANT_READ_ONLY` | `false` | Hide mutation tools |
 | `QDRANT_ALLOW_ARBITRARY_FILTER` | `false` | Allow raw Qdrant filters on legacy find |
 | `QDRANT_ENABLE_COLLECTION_MANAGEMENT` | `true` | Register collection tools |
 | `QDRANT_ENABLE_DYNAMIC_EMBEDDING_MODELS` | `true` | Register embedding model tools |
-| `QDRANT_ENABLE_RESOURCES` | `true` | Register MCP resources |
-| `QDRANT_DEFAULT_VECTOR_SIZE` | `384` | Default vector-size setting |
-| `QDRANT_DEFAULT_DISTANCE_METRIC` | `cosine` | Default distance metric setting |
-| `QDRANT_MAX_BATCH_SIZE` | `10000` | Configured batch-size ceiling |
-| `QDRANT_MCP_TOOL_PROFILE` | `canonical` | Tool exposure profile |
-| `QDRANT_METADATA_MAX_PROCS` | `8` | Maximum concurrent macOS metadata subprocesses |
+| `QDRANT_DEFAULT_VECTOR_SIZE` | `384` | Default vector size |
+| `QDRANT_DEFAULT_DISTANCE_METRIC` | `cosine` | Default distance metric |
+| `QDRANT_MCP_TOOL_PROFILE` | `canonical` | Tool profile: `minimal`, `canonical`, `full` |
 
-HTTP transport variables:
+### HTTP transport
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `MCP_TRANSPORT` | `stdio` | `stdio`, `sse`, `streamable-http`, or `http` |
 | `MCP_HOST` | `127.0.0.1` | HTTP bind host |
 | `MCP_PORT` | `8000` | HTTP bind port |
-| `FASTMCP_PORT` | `8000` fallback | Alternate port variable |
-| `MCP_HTTP_AUTH_TOKEN` | unset | Optional bearer token |
+| `MCP_HTTP_AUTH_TOKEN` | unset | Optional Bearer token |
 | `MCP_HTTP_ALLOWED_ORIGINS` | unset | Allowed HTTP origins |
 
-Development dependency policy:
+---
 
-- Use `uv sync --frozen --group dev` for normal setup.
-- Use `uv run --locked ...` for day-to-day commands when possible.
-- Treat `uv.lock` as committed, cross-platform state; dependency updates
-  should be deliberate and reviewed, preferably from a single canonical
-  environment.
+## BGE and other FastEmbed models
 
-## Perplexity MCP Research Companion
+FastEmbed-reported BGE v1.5 models are selectable:
 
-This repository work has used a separate Perplexity MCP server for external
-research. It is not part of `mcp-server-qdrant`; it is an auxiliary MCP tool
-available in this Codex environment. When asking an agent to use Perplexity, be
-explicit about both the **mode** and the **source focus**.
+- `BAAI/bge-small-en-v1.5`
+- `BAAI/bge-base-en-v1.5`
+- `BAAI/bge-large-en-v1.5`
 
-Perplexity modes map to MCP tools like this:
+They work when a collection is created and data is embedded with that model.
+Existing Qwen3 collections keep their Qwen3 vector names and dimensions.
+`BAAI/bge-m3` is not currently listed by the installed FastEmbed registry.
 
-| Human request | Perplexity MCP tool | What it does | When to use |
-| --- | --- | --- | --- |
-| Search | `perplexity_search` or `perplexity_ask` with concise/default mode | One-step lookup plus quick synthesis | Daily questions, quick answers, current facts |
-| Reasoning | `perplexity_reason` or `perplexity_ask` with `mode="copilot"` / reasoning model when available | Uses stronger reasoning over web context | Multi-step debugging, analytical coding/math questions |
-| Deep Research | `perplexity_research` | Agentic research loop over many sources, returns a mini-report | Technical investigations, competitive analysis, literature-review style work |
-| Compute / ASI | `perplexity_compute` | Computer/ASI mode for heavier task execution | Calculation-heavy or workflow-like research tasks |
-
-Source focus is a separate setting. It changes where Perplexity looks, not
-which reasoning mode it uses:
-
-| Focus | MCP value here | What it surfaces | Best use cases |
-| --- | --- | --- | --- |
-| Web | `sources=["web"]` | Broad internet: docs, news, blogs, product pages | General research, current events, product overviews |
-| Academic | `sources=["scholar"]` | Papers, scholarly indexes, arXiv-style sources | Scientific/technical questions and citation-heavy reports |
-| Social | `sources=["social"]` | Reddit, X/Twitter, forums, community discussion | Developer sentiment, community workarounds, “what are people saying?” |
-
-The common mistake is mixing up **mode** and **focus**. For example, asking for
-“research with social sources” means `perplexity_research` plus
-`sources=["social"]`. Asking for “reasoning with social sources” means
-`perplexity_reason` or a reasoning/copilot ask plus `sources=["social"]`.
-
-The current Perplexity MCP schema exposes `web`, `scholar`, and `social` source
-focus values. Perplexity product focus modes such as Video and Writing may exist
-in the Perplexity UI, but they are not part of the MCP source list used here
-unless that MCP server adds them.
-
-Examples:
-
-```text
-Use Perplexity deep research with sources=["scholar"] to compare Qdrant
-multivector late-interaction implementation patterns.
-```
-
-```text
-Use Perplexity reasoning with sources=["social"] to debug why Codex MCP stdio
-transports are closing for this server.
-```
-
-```text
-Use Perplexity search with sources=["web"] for the current FastMCP output_schema
-API and cite official docs.
-```
-
-In this session, “research” means `perplexity_research`. “Reasoning” means
-`perplexity_reason` or `perplexity_ask` configured for a reasoning/copilot mode.
-If the request matters, spell out the exact tool or mode.
-
-## MCP resources
-
-When resources are enabled:
-
-- `qdrant://collections`: markdown overview of all collections.
-- `qdrant://collection/{collection_name}/schema`: markdown schema/statistics
-  for one collection.
-
-## Development notes
-
-Useful commands:
+Optional FlagEmbedding smoke test (skipped unless installed):
 
 ```bash
-uv sync --frozen --group dev
-uv run --locked pytest
-uv run --locked ruff check src tests
-./scripts/local-run-qdrant.sh
-./scripts/local-configure-hermes.py
-./scripts/local-doctor.sh
-uv run mcp-server-qdrant --transport stdio
-uv run mcp-server-qdrant-webui --host 127.0.0.1 --port 8765 --reload
+uv pip install FlagEmbedding
+uv run --locked pytest tests/test_flagembedding_optional.py
 ```
 
-Main code areas:
+---
+
+## Verification
+
+```bash
+uv run --locked pytest
+curl http://127.0.0.1:8765/health
+```
+
+Expected test result: `60 passed, 1 skipped` (FlagEmbedding optional test).
+
+---
+
+## Known limitations
+
+- OCR is not implemented. Image-only PDFs fail with an OCR-needed message.
+- `.docx` tables are extracted; embedded images are not.
+- Late-interaction retrieval requires a collection created with
+  `create_late_interaction_collection`; dense/hybrid collections cannot be
+  queried with that mode.
+- Parent-child chunking is not yet implemented. The current paragraph-aware
+  chunker with small overlap is good for most cases but can truncate evidence
+  across chunk boundaries. A future improvement would retrieve small child
+  chunks and return larger parent-window context to the answer generator.
+- Qwen3-Reranker-4B on MPS takes 0.5–1s per 4-chunk batch. For 100-candidate
+  pools this means 13–25 seconds per reranked search. This is a good tradeoff
+  for quality-focused book retrieval; for low-latency use, switch to
+  `Qwen/Qwen3-Reranker-0.6B` or `Xenova/ms-marco-MiniLM-L-6-v2`.
+
+---
+
+## Main code areas
 
 | Path | Purpose |
 | --- | --- |
@@ -1084,23 +962,49 @@ Main code areas:
 | `src/mcp_server_qdrant/mcp_server.py` | MCP tool registration |
 | `src/mcp_server_qdrant/qdrant.py` | async Qdrant connector |
 | `src/mcp_server_qdrant/embedding_manager.py` | FastEmbed model registry |
-| `src/mcp_server_qdrant/embeddings/` | dense and sparse embedding providers |
+| `src/mcp_server_qdrant/embeddings/` | dense, sparse, late-interaction providers |
 | `src/mcp_server_qdrant/ingest/` | extraction, metadata, document IDs |
-| `src/mcp_server_qdrant/search/` | grouped search, filter grammar, reranking |
+| `src/mcp_server_qdrant/search/` | grouped search, reranker, diversity pass, filter grammar |
 | `src/mcp_server_qdrant/mcp_runtime/` | profiles, envelopes, HTTP security |
 | `src/mcp_server_qdrant/webui/` | FastAPI app |
 | `tests/` | pytest suite |
+| `rust/qwen3_embedder/` | Rust Qwen3 embedding sidecar |
+| `scripts/` | local setup, launch, migration, doctor scripts |
 
-## Known limitations
+---
 
-- OCR is not implemented. Probably scanned/image-only PDFs fail early with an
-  OCR-needed extraction message after lightweight preflight.
-- `.docx` tables are extracted with `python-docx`; embedded images are not.
-- Only FastEmbed is implemented as an embedding provider.
-- Late-interaction retrieval requires a collection created with
-  `create_late_interaction_collection` or chunks ingested with
-  `mode="late_interaction"`; dense/hybrid collections cannot be queried with
-  that mode.
+## Perplexity MCP research companion
+
+This repository work has used a separate Perplexity MCP server for external
+research. It is not part of `mcp-server-qdrant`; it is an auxiliary MCP tool
+available when configured in Claude Code's MCP server list.
+
+Perplexity modes:
+
+| Human request | MCP tool | What it does |
+| --- | --- | --- |
+| Search | `perplexity_search` / `perplexity_ask` | One-step lookup + quick synthesis |
+| Reasoning | `perplexity_reason` | Multi-step debugging, analytical questions |
+| Deep Research | `perplexity_research` | Agentic research loop, mini-report |
+
+Source focus (`sources=["web" | "scholar" | "social"]`) is separate from mode.
+
+---
+
+## Development
+
+```bash
+uv sync --frozen --group dev
+uv run --locked pytest
+uv run --locked ruff check src tests
+./scripts/local-run-qdrant.sh
+uv run mcp-server-qdrant-webui --host 127.0.0.1 --port 8765 --reload
+```
+
+Dependency policy: treat `uv.lock` as committed, cross-platform state.
+Dependency updates should be deliberate and reviewed.
+
+---
 
 ## License
 
