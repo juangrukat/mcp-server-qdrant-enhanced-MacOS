@@ -12,12 +12,17 @@ SUPPLEMENTAL_MODELS = [
     {
         "model": "Qwen/Qwen3-Embedding-8B",
         "dim": 4096,
-        "description": "Qwen3 8B text embedding model — up to 4096D, strong multilingual and code retrieval",
+        "description": "Qwen3 8B text embedding model - up to 4096D, strong multilingual and code retrieval",
+    },
+    {
+        "model": "Qwen/Qwen3-Embedding-4B",
+        "dim": 2560,
+        "description": "Qwen3 4B text embedding model - 2560D, lighter than 8B for local Apple Silicon runs",
     },
     {
         "model": "Qwen/Qwen3-Embedding-0.6B",
         "dim": 1024,
-        "description": "Qwen3 0.6B text embedding model — lightweight, 1024D",
+        "description": "Qwen3 0.6B text embedding model - lightweight, 1024D",
     },
 ]
 
@@ -103,6 +108,11 @@ class EnhancedEmbeddingModelManager:
         settings = EmbeddingProviderSettings(
             EMBEDDING_MODEL=model_name,
             EMBEDDING_DEVICE=self.default_settings.device,
+            QWEN3_SIDECAR_PATH=self.default_settings.qwen3_sidecar_path,
+            QWEN3_MAX_LENGTH=self.default_settings.qwen3_max_length,
+            QWEN3_DTYPE=self.default_settings.qwen3_dtype,
+            QWEN3_METRICS_PATH=self.default_settings.qwen3_metrics_path,
+            QWEN3_RESPONSE_LIMIT_BYTES=self.default_settings.qwen3_response_limit_bytes,
         )
         return create_embedding_provider(settings)
 

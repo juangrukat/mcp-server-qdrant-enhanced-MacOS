@@ -190,8 +190,8 @@ def supported_extractors_payload() -> dict[str, Any]:
         ],
         "chunking": {
             "strategy": "paragraph-aware with hard split for oversized paragraphs",
-            "target_chunk_chars": 1500,
-            "overlap_chars": 150,
+            "target_chunk_chars": 700,
+            "overlap_chars": 70,
         },
     }
 

@@ -1,458 +1,337 @@
-# Handoff Brief — `mcp-server-qdrant-enhanced-MacOS`
-
-> Last updated: 2026-05-03
-> Repo: <https://github.com/juangrukat/mcp-server-qdrant-enhanced-MacOS>
-> Audience: a fresh session (human or model) picking this up cold.
-
-This document is the single source of truth for "where is this project and
-what's next." Read it top-to-bottom before making changes. If you finish a
-priority below, update the **Status** column and the **Last updated** date.
-
----
-
-## 1. TL;DR
-
-A macOS-native fork of the Qdrant MCP server. It now does:
-
-- Defaults to collection `documents` when callers omit a collection name
-- Uses project-root `storage/` as the shared default local/Docker storage directory
-- **macOS file ingestion** (.txt, .md, .pdf, .docx) with Spotlight + Finder metadata
-- **Expanded file ingestion** for plain-text-ish formats plus structured `.json`, `.jsonl`, `.csv`, and `.tsv`
-- **Qwen3-Embedding-8B** (4096D) supplemental dense model alongside the FastEmbed lineup
-- **Hybrid retrieval** — dense + sparse (Qdrant/bm25) with server-side RRF fusion
-- **Document-grouped search** with reranker abstraction (NoOp / FastEmbed cross-encoder / Qwen3-Reranker stub)
-- **Filter grammar** (`must`/`should`/`must_not` × `==`/`!=`/`>`/`>=`/`<`/`<=`/`any`/`except`)
-- **MCP layer overhaul** (this is the meaningful new surface):
-  - dual transport: `stdio` and Streamable HTTP (loopback bind, Origin allowlist, optional Bearer token)
-  - tool profiles `minimal | canonical | full` driven by `QDRANT_MCP_TOOL_PROFILE`
-  - structured response envelope `{contract, data, observability}` on priority tools
-  - five discovery tools (`get_server_capabilities`, `get_indexed_fields`, `get_supported_extractors`, `get_collection_schema`, `list_search_modes`)
-  - per-request embedding provider resolution (multi-agent safe)
-  - report/apply gating on `delete_collection` and `ingest_folder`
-- **FastAPI REST surface** — same connector + pipeline, served via `mcp-server-qdrant-webui`
-
-The local working directory is `/Users/kat/REPOS/mcp-server-qdrant-enhanced/`
-(the original clone — not renamed, by design). The remote `macos-fork` points
-at the public repo above; `origin` is the upstream `angrysky56` fork; `upstream`
-is `qdrant/mcp-server-qdrant`.
-
----
-
-## 2. Repository map
-
-```
-src/mcp_server_qdrant/
-├── main.py                    # CLI entry: --transport stdio|sse|streamable-http|http
-├── server.py                  # bootstraps QdrantMCPServer
-├── mcp_server.py              # FastMCP subclass — registers tools, profile gate
-├── settings.py                # pydantic settings (env-driven)
-├── enhanced_tool_descriptions.py  # human-readable tool docstrings
-├── qdrant.py                  # QdrantConnector — store/search/hybrid methods
-├── embedding_manager.py       # FastEmbed registry + Qwen3 supplemental
-├── docker_utils.py            # auto-spawn local Qdrant container
-├── port_manager.py            # interactive port handling
-│
-├── embeddings/
-│   ├── base.py                # EmbeddingProvider ABC
-│   ├── fastembed.py           # dense provider; KNOWN_MODEL_DIMS fallback for Qwen
-│   ├── sparse.py              # SparseEmbeddingProvider (Qdrant/bm25 default)
-│   ├── factory.py             # provider construction
-│   └── types.py
-│
-├── ingest/
-│   ├── extractor.py           # txt/md/pdf/docx; pdfminer→pypdf fallback
-│   ├── macos_metadata.py      # mdls + xattr + MACOS_INDEX_FIELDS
-│   └── document_id.py         # sha1-based stable doc ids
-│
-├── search/
-│   ├── document_search.py     # group-by-document reranking + overfetch
-│   ├── filter_grammar.py      # high-level filter compiler
-│   ├── retrieval_mode.py      # dense | hybrid | rerank | late_interaction
-│   └── reranker.py            # Reranker ABC + NoOp + FastEmbed + Qwen3 stub
-│
-├── mcp_runtime/               # NEW: MCP-layer concerns
-│   ├── http_security.py       # OriginValidationMiddleware, BearerAuthMiddleware
-│   ├── profiles.py            # ToolProfile enum + TOOL_PROFILES map
-│   ├── envelope.py            # success/failure helpers, envelope_context
-│   ├── discovery.py           # static payloads for discovery tools
-│   ├── provider_resolver.py   # per-request provider cache
-│   └── plan_registry.py       # report/apply plan registry
-│
-├── webui/
-│   ├── api.py                 # FastAPI app — mirrors MCP tools as REST
-│   └── main.py                # uvicorn entry: mcp-server-qdrant-webui
-│
-└── common/
-    ├── filters.py             # legacy make_indexes
-    ├── func_tools.py          # make_partial_function
-    └── wrap_filters.py        # wrap_filters
-```
-
-> The submodule was named `mcp_runtime` (not `mcp`) to avoid shadowing the
-> top-level `mcp` SDK package that fastmcp depends on.
-
----
-
-## 3. What's been done (commit timeline)
-
-### Phase 1 — foundation (5 commits, pushed)
-| Commit | Subject |
-|---|---|
-| `310b9eb` | feat: add Qwen3 embedding support and per-collection model swapping |
-| `27eaa9c` | feat: add macOS metadata ingestion and text extractors |
-| `520d81f` | feat: add hybrid search, filter grammar, and reranker abstraction |
-| `924f87b` | feat: add FastAPI REST API for web UI integration |
-| `270a73a` | docs: update README, configs, Dockerfile, and requirements |
-
-### Phase 2 — MCP layer overhaul (7 commits, pushed)
-| Commit | Subject |
-|---|---|
-| `c901cdf` | feat(mcp): add streamable-http transport for multi-client local use |
-| `4e42424` | feat(mcp): add tool profiles (minimal \| canonical \| full) |
-| `57098e2` | feat(mcp): add structured response envelope for priority tools |
-| `01ef33c` | feat(mcp): add discovery / capability tools |
-| `23d0b0c` | feat(mcp): per-request embedding provider resolution |
-| `b2e39cc` | feat(mcp): add report/apply gating for delete_collection and ingest_folder |
-| `1ec20cd` | docs(mcp): document transports, profiles, envelope, discovery, report/apply |
-
-All commits include `Co-Authored-By: Claude Sonnet 4.6`.
-
----
-
-## 4. Acceptance criteria — current state
-
-| Criterion | Status |
-|---|---|
-| `stdio` and Streamable HTTP transport | ✅ done |
-| Multi-agent safety (no shared mutable provider) | ✅ done — per-request resolver, providers cached but never mutated |
-| Profile-based tool exposure | ✅ done — `minimal=11`, `canonical=15`, `full=21` tools (counts include discovery) |
-| Structured response envelope on priority tools | ✅ done for 6 tools + 5 discovery tools |
-| Discovery tools | ✅ done — 5 tools |
-| README explains the new MCP model | ✅ done |
-| Existing core functionality still works | ✅ verified with unit, stdio transport, and streamable HTTP concurrent-client tests. |
-| `outputSchema` + `structuredContent` declared per tool | ✅ done for priority tools — FastMCP upgraded to 2.14 and `_profile_tool` attaches schemas from `mcp_runtime/schemas.py` |
-| Test coverage for transport, schema, multi-client | ✅ focused pytest coverage now exists for schemas, profiles, envelope helpers, plan registry, filter grammar, resolver persistence, provider-safe search, late interaction, async metadata, settings, extractors, stdio transport, and concurrent streamable HTTP clients. |
-
----
-
-## 5. Known limitations / blockers
-
-### 5a. `outputSchema` declared at MCP protocol level ✅ resolved
-FastMCP is upgraded to 2.14.7 and priority tools get native `output_schema`
-metadata through `_profile_tool`. Schemas live in
-`src/mcp_server_qdrant/mcp_runtime/schemas.py`; `tests/test_output_schemas.py`
-verifies representative tools expose schemas.
-
-### 5b. Test coverage for production blockers ✅ resolved
-Focused pytest coverage now exists for default settings, expanded extractors,
-priority output schemas, profiles, envelope helpers, plan registry, filter
-grammar, provider resolver persistence, async macOS metadata, provider-safe
-connector search, late-interaction retrieval, stdio transport, and concurrent
-streamable HTTP clients. Old manual/debug fork-era scripts were removed from
-the active test tree.
-
-### 5c. `late_interaction` retrieval mode ✅ implemented
-`late_interaction` now uses FastEmbed `LateInteractionTextEmbedding` with a
-Qdrant multivector field configured for `MAX_SIM`. Use
-`create_late_interaction_collection` or ingest with `mode="late_interaction"`,
-then query with `search_documents(mode="late_interaction")`.
-
-### 5d. Sparse provider singleton ✅ resolved
-`get_sparse_provider(model_name)` now caches providers by sparse model name
-instead of keeping one global lazy singleton. Default use remains
-`Qdrant/bm25`, but future sparse models no longer require a mutable global
-"current provider".
-
-### 5e. `set_collection_embedding_model` storage ✅ resolved
-Collection→model assignments persist to `<storage>/collection_models.json`
-with atomic temp-file replacement, and are loaded into
-`ProviderResolver._collection_models` on server startup.
-
-### 5e.1. `.docx` table extraction ✅ improved
-`.docx` extraction now uses `python-docx` `iter_inner_content()` so body
-paragraphs and tables are rendered in document order. Table rows/cells are
-included as searchable text, including nested table content inside cells.
-
-### 5e.2. FlagEmbedding/BGE portability check ✅ optional
-`tests/test_flagembedding_optional.py` uses `pytest.importorskip("FlagEmbedding")`
-and checks `BAAI/bge-base-en-v1.5` returns a 768-dimensional vector when the
-optional dependency is installed. This does not make FlagEmbedding a runtime
-dependency.
-
-### 5f. `qdrant_find` provider safety ✅ resolved
-`QdrantConnector.search()` now accepts an optional per-request
-`embedding_provider`, and legacy `qdrant_find` resolves its provider via
-`ProviderResolver`. The curated `search_documents` path is still preferred.
-
-### 5g. uv lockfile drift on macOS ✅ mitigated
-README now documents `uv sync --frozen --group dev` and `uv run --locked`.
-GitHub Actions test CI now runs a macOS/Linux matrix with frozen sync and
-locked pytest; publish CI also uses frozen sync / locked build. Dependency
-updates should be deliberate `uv lock` changes.
-
-### 5h. macOS metadata extraction blocks the event loop ✅ resolved
-Async tool handlers now call `get_macos_metadata_async()`, which uses
-`asyncio.create_subprocess_exec` plus a bounded semaphore
-(`QDRANT_METADATA_MAX_PROCS`, default 8). The sync function remains available
-for non-async callers.
-
----
-
-## 6. Next-session priorities (ordered)
-
-> Each priority has: scope, why it matters, files touched, exit criteria,
-> and an estimated effort. Do them in this order unless you have a reason
-> to deviate. **Don't bundle priorities into one giant commit.**
-
-### Priority 1 — `outputSchema` per priority tool 🔴 high value
-**Why:** the brief explicitly required this; without it, agent clients
-can't introspect tool return shapes. Strict MCP clients will see
-unschema'd tools.
-
-**Approach:** post-process FunctionTool objects after registration. After
-`self.tool(...)(fn)` returns the `FunctionTool`, write its `outputSchema`
-metadata directly. The fastmcp `FunctionTool` exposes
-`output_schema: dict | None` (verify in 2.8 source). If not, attach via
-`tool.annotations["outputSchema"] = ...` and fall back at protocol level.
-
-**Per-tool schemas needed:**
-- `search_documents` — full schema given in the original brief
-- `ingest_file` — `{contract, data: {filename, document_id, chunks_stored, extractor_used, char_count, page_count}, observability}`
-- `ingest_folder` — `{contract, data: {folder, files_processed, files_total, chunks_stored, errors[]}, observability}` plus the `mode=report` variant `{contract, data: {mode, plan_id, plan, expires_at}, observability}`
-- `create_collection`, `create_hybrid_collection` — `{contract, data: {collection_name, vector_size, distance, embedding_model, hybrid}, observability}`
-- `bootstrap_collection_indexes` — `{contract, data: {collection, indexes_ensured: string[]}, observability}`
-- Discovery tools — define schemas matching `mcp_runtime/discovery.py` payloads
-- `delete_collection` — split schema for report vs apply variants
-
-**Files:**
-- `src/mcp_server_qdrant/mcp_runtime/schemas.py` (new) — JSON Schema definitions
-- `src/mcp_server_qdrant/mcp_server.py` — extend `_profile_tool` to attach schemas
-
-**Exit criteria:**
-1. `tools/list` over MCP includes `outputSchema` for every priority tool
-2. Returns conform to schemas (strict subset of envelope is OK)
-3. Document the schemas in the README
-
-**Effort:** half a session. Mostly mechanical — define schemas + thread
-through the wrapper.
-
-### Priority 2 — test suite 🔴 required
-**Why:** acceptance criteria. Also: zero tests means refactoring is
-risky.
-
-**Coverage targets:**
-1. `mcp_runtime/profiles.py` — `is_tool_visible` for every (tool, profile) pair
-2. `mcp_runtime/envelope.py` — success/failure shapes, contract version stable
-3. `mcp_runtime/plan_registry.py` — TTL, single-use, cross-tool rejection, expired
-4. `mcp_runtime/provider_resolver.py` — explicit > collection > default, cache hit/miss
-5. `mcp_runtime/http_security.py` — Origin allow/deny, Bearer present/absent/wrong
-6. `search/filter_grammar.py` — every operator, type coercion, ISO date detection
-7. `search/document_search.py` — grouping, overfetch, score ordering
-8. `ingest/extractor.py` — txt/md frontmatter, PDF fallback path, DOCX
-9. **Multi-client integration test** — start the HTTP server, hit it concurrently from two asyncio clients, verify no cross-contamination of provider state. Use fastmcp's test client.
-10. `outputSchema` conformance — once Priority 1 lands, validate every priority tool's return against its declared schema.
-
-**Files:**
-- `tests/test_profiles.py` (new)
-- `tests/test_envelope.py` (new)
-- `tests/test_plan_registry.py` (new)
-- `tests/test_provider_resolver.py` (new)
-- `tests/test_http_security.py` (new)
-- `tests/test_filter_grammar.py` (new)
-- `tests/test_document_search.py` (new)
-- `tests/test_extractor.py` (new)
-- `tests/test_multi_client_http.py` (new) — the most important one
-- `tests/conftest.py` — fixtures for QdrantConnector with local path, sample fixtures dir for ingestion
-
-**Pin notes:** `pytest-asyncio>=0.23` is already in dev-deps. Use `asyncio_mode = "auto"`. fastmcp has its own test utilities — see <https://gofastmcp.com/v2/testing>.
-
-**Exit criteria:** `uv run pytest` green; >80% coverage on `mcp_runtime/`.
-
-**Effort:** a full focused session.
-
-### Priority 3 — persist `set_collection_embedding_model` assignments 🟡 medium
-**Why:** the assignment is lost on restart, which is surprising for users.
-
-**Approach:** simplest path — sidecar JSON file at
-`<qdrant_local_path>/_assignments.json` (when local) or env-var-configurable
-path (`QDRANT_ASSIGNMENTS_FILE`). On startup, load. On `assign_collection_model`,
-write atomically.
-
-For external Qdrant, the file path needs an explicit env var or it ends up
-in the working directory. Document this clearly.
-
-**Files:**
-- `src/mcp_server_qdrant/mcp_runtime/provider_resolver.py` — add load/save
-- `src/mcp_server_qdrant/settings.py` — add the env var
-
-**Effort:** quarter session.
-
-### Priority 4 — async-friendly macOS metadata 🟡 medium
-**Why:** ingesting a folder of N files spawns N synchronous `mdls` calls
-on the event loop. Folder ingest of 1000s of files is unusably slow.
-
-**Approach:** wrap `subprocess.run` calls in
-`loop.run_in_executor`. Even better, batch: `mdls` accepts multiple paths.
-Preserve the per-file dict shape.
-
-**Files:**
-- `src/mcp_server_qdrant/ingest/macos_metadata.py`
-
-**Effort:** quarter session. Profile a realistic folder before/after.
-
-### Priority 5 — connector quickstart docs 🟢 low priority
-**Why:** brief asked for client connector examples (Claude Code, Codex, VS Code).
-These live in markdown today. Worth adding sample config files in
-`examples/` or `connectors/`.
-
-**Files:**
-- `connectors/claude-code.json`
-- `connectors/claude-desktop.json`
-- `connectors/lm-studio.json`
-- `connectors/cursor.json`
-- `connectors/vscode.json`
-- `README.md` — link them
-
-**Effort:** quarter session.
-
-### Priority 6 — `late_interaction` retrieval mode ✅ done
-Implemented with Qdrant multivectors, FastEmbed
-`LateInteractionTextEmbedding`, `create_late_interaction_collection`,
-late-interaction ingest, grouped search routing, and focused tests.
-
-### Priority 7 — evaluation harness 🟢 research / future
-**Why:** retrieval-quality choices are hard to validate without metrics.
-Brief mentioned BEIR-style nDCG@10 / Recall@k / MRR.
-
-**Approach:** add a `eval/` directory with a small gold set (your own docs
-or BEIR scifact), an eval script, and a Markdown table comparing dense vs
-hybrid vs rerank.
-
-**Effort:** full session.
-
----
-
-## 7. Operational reference
-
-### Running the server
+# Handoff: mcp-server-qdrant-enhanced
+
+Last updated: 2026-05-03
+
+Repo path: `/Users/kat/REPOS/mcp-server-qdrant-enhanced`
+
+## Current State
+
+This repo runs locally with either single-process Qdrant embedded storage or
+multi-agent Qdrant server mode, plus a Rust fastembed/Candle sidecar for Qwen3
+embeddings on Apple Silicon Metal.
+
+The active local REST API was last verified at:
+
+- URL: `http://127.0.0.1:8765`
+- Docs: `http://127.0.0.1:8765/docs`
+- Active model: `Qwen/Qwen3-Embedding-4B`
+- Vector size: `2560`
+- Test result: `44 passed, 1 skipped`
+
+The optional skipped test is:
+
+- `tests/test_flagembedding_optional.py`
+- Reason: `FlagEmbedding` is optional; it skips a BGE compatibility smoke test.
+
+## Important Runtime State
+
+Runtime state is intentionally ignored by Git:
+
+- `.local/`
+- `storage/`
+- `logs/`
+- `.DS_Store`
+
+Useful local files:
+
+- Sidecar binary: `rust/qwen3_embedder/target/release/qwen3-embedder`
+- Metrics JSONL: `.local/logs/qwen3-embeddings.jsonl`
+- Embedded Qdrant storage: `.local/qdrant-storage` for one-process local mode
+- Qdrant server storage: `.local/qdrant-server-storage` when using Docker server mode
+
+## Local Scripts
+
+Use these from the repo root:
+
 ```bash
-# stdio (default — for Claude Desktop, LM Studio, etc.)
-uv run mcp-server-qdrant
-
-# Streamable HTTP for multi-agent local use
-uv run mcp-server-qdrant --transport streamable-http --port 8000
-
-# REST API (parallel surface for web UI)
-uv run mcp-server-qdrant-webui --host 127.0.0.1 --port 8765
+./scripts/local-install.sh
+./scripts/local-run-qdrant.sh
+./scripts/local-run-webui.sh
+./scripts/local-run-mcp.sh
 ```
 
-### Key environment variables
-| Var | Default | Purpose |
-|---|---|---|
-| `QDRANT_URL` | — | Qdrant HTTP endpoint |
-| `QDRANT_LOCAL_PATH` | — | Local file mode (mutually exclusive with URL) |
-| `EMBEDDING_MODEL` | `sentence-transformers/all-MiniLM-L6-v2` | Default dense model |
-| `QDRANT_DEFAULT_VECTOR_SIZE` | `384` | Bump to `4096` for Qwen3-Embedding-8B default |
-| `QDRANT_MCP_TOOL_PROFILE` | `canonical` | `minimal`, `canonical`, or `full` |
-| `MCP_TRANSPORT` | `stdio` | CLI override: `--transport` |
-| `MCP_HOST` | `127.0.0.1` | HTTP bind (loopback only by default) |
-| `MCP_PORT` | `8000` | HTTP port |
-| `MCP_HTTP_AUTH_TOKEN` | — | Required Bearer token if set |
-| `MCP_HTTP_ALLOWED_ORIGINS` | localhost+127.0.0.1 | Comma-separated extra origins |
+`scripts/local-env.sh` sets the local defaults:
 
-### Smoke test commands
+- `QDRANT_MODE=embedded`
+- `QDRANT_LOCAL_PATH=.local/qdrant-storage`
+- `EMBEDDING_MODEL=Qwen/Qwen3-Embedding-8B` unless overridden
+- `QWEN3_DEVICE=auto`
+- `QWEN3_MAX_LENGTH=1024`
+- `QWEN3_DTYPE=auto`
+- `QWEN3_RESPONSE_LIMIT_BYTES=67108864`
+- `QDRANT_EMBEDDING_BATCH_SIZE=4`
+- `QDRANT_INGEST_CHUNK_SIZE=700`
+- `QDRANT_INGEST_CHUNK_OVERLAP=70`
+- `QDRANT_WRITE_MAX_CONCURRENCY=1`
+- `QDRANT_WRITE_QUEUE_SIZE=8`
+
+For local book ingestion, 4B is much more practical:
+
 ```bash
-# Imports clean, server constructs:
-uv run python -c "from mcp_server_qdrant.mcp_server import QdrantMCPServer; print('OK')"
+EMBEDDING_MODEL='Qwen/Qwen3-Embedding-4B' ./scripts/local-run-webui.sh
+```
 
-# Tool registration under each profile:
-QDRANT_MCP_TOOL_PROFILE=minimal uv run python -c "..."  # see commit 4e42424 for full snippet
+For launch/multi-agent use, run one Qdrant server and point REST plus MCP at
+`QDRANT_URL`:
 
-# REST API smoke:
-uv run mcp-server-qdrant-webui --port 8765 &
+```bash
+./scripts/local-run-qdrant.sh
+QDRANT_MODE=server EMBEDDING_MODEL='Qwen/Qwen3-Embedding-4B' ./scripts/local-run-webui.sh
+QDRANT_MODE=server EMBEDDING_MODEL='Qwen/Qwen3-Embedding-4B' ./scripts/local-run-mcp.sh --transport streamable-http
+```
+
+`local-run-qdrant.sh` needs a reachable Docker daemon.
+
+Do not run REST and stdio MCP against the same embedded `.local/qdrant-storage`
+path at the same time. Qdrant local mode locks the path by design. Also do not
+mount `.local/qdrant-storage` directly into a Qdrant Docker server; migrate
+collections with `scripts/migrate-local-to-server.py` instead.
+
+Launch note: Qdrant server can accept concurrent clients, but local embedding
+and ingestion still need backpressure. REST and MCP now use a bounded in-process
+write queue for store/ingest operations. Default local launch runs one active
+embedding/upsert write at a time with eight queued jobs. Prefer one streamable
+HTTP MCP server for multi-agent use so agents share the same queue.
+
+## Qwen3 Sidecar Notes
+
+The Rust sidecar lives in `rust/qwen3_embedder/`.
+
+It uses crates.io `fastembed` with features:
+
+- `hf-hub`
+- `metal`
+- `ort-download-binaries-rustls-tls`
+- `qwen3`
+
+Qwen3 models route through `Qwen3RustProvider`:
+
+- `Qwen/Qwen3-Embedding-0.6B`: 1024 dimensions
+- `Qwen/Qwen3-Embedding-4B`: 2560 dimensions
+- `Qwen/Qwen3-Embedding-8B`: 4096 dimensions
+
+The Python provider adds `passage: ` to document embeddings and uses the
+Qwen-style query instruction prompt in the Rust sidecar.
+
+Important bug fixed:
+
+- Multi-vector JSON responses exceeded Python asyncio subprocess's default
+  line-read limit.
+- Symptom looked like: `Separator is not found, and chunk exceed the limit`.
+- Actual fix: pass a larger `limit` to `asyncio.create_subprocess_exec`.
+- Config: `QWEN3_RESPONSE_LIMIT_BYTES`.
+
+## Metrics
+
+Every Qwen3 provider request appends JSONL to:
+
+```text
+.local/logs/qwen3-embeddings.jsonl
+```
+
+Each record includes:
+
+- timestamp
+- operation
+- model
+- requested device/backend
+- dtype
+- max length
+- vector size
+- text count
+- char count
+- embedding count
+- cold start time
+- request time
+- total time
+- success/error
+
+These records are the basis for future ranking/performance reports.
+
+Observed local timings:
+
+- Qwen3 8B on Metal/F16: roughly 55-70 seconds per 4 chunks.
+- Qwen3 4B on Metal/F16: roughly 2.5-4 seconds per 4 chunks after warmup.
+- 4B is the practical default for local book-scale ingestion.
+
+## Collections Verified
+
+Current known local collections:
+
+- `documents`
+- `socratic_circles_qwen3_4b`
+
+Verified Socratic Circles ingest:
+
+- Source file: local Calibre PDF for Matt Copeland's *Socratic Circles*
+- Collection: `socratic_circles_qwen3_4b`
+- Model: `Qwen/Qwen3-Embedding-4B`
+- Vector size: `2560`
+- Pages: `173`
+- Extracted chars: `437546`
+- Chunks stored: `878`
+
+Both endpoints were verified after fixing the query shape:
+
+- `POST /search`
+- `POST /search_documents`
+
+## PDF Safeguards
+
+Encrypted/password-protected PDFs are now detected in PDF preflight and fail
+before extraction/embedding.
+
+Why this matters:
+
+- A password-protected PDF previously produced garbage-looking text from
+  extractors, then wasted time embedding bad chunks.
+- Now the extractor returns a clear error:
+  `PDF is encrypted/password-protected and cannot be ingested without a password.`
+
+OCR is still not implemented. Probably scanned/image-only PDFs fail early with
+an OCR-needed message.
+
+## MCP Communication
+
+### Stdio MCP
+
+Use this when an MCP client launches the server process:
+
+```bash
+./scripts/local-run-mcp.sh
+```
+
+or:
+
+```bash
+uv run --locked mcp-server-qdrant --transport stdio
+```
+
+### Streamable HTTP MCP
+
+Use this when multiple local clients/agents should share one MCP server process.
+For true REST+MCP concurrency, also use Qdrant server mode:
+
+```bash
+QDRANT_MODE=server uv run --locked mcp-server-qdrant --transport streamable-http --host 127.0.0.1 --port 8000
+```
+
+If auth is enabled, send:
+
+```http
+Authorization: Bearer <MCP_HTTP_AUTH_TOKEN>
+```
+
+Recommended MCP tool flow:
+
+1. `get_server_capabilities`
+2. `list_embedding_models`
+3. `create_collection`
+4. `bootstrap_collection_indexes`
+5. `ingest_file` or `ingest_folder`
+6. `search_documents`
+
+Useful MCP tools:
+
+- `list_collections`
+- `get_collection_info`
+- `list_embedding_models`
+- `create_collection`
+- `set_collection_embedding_model`
+- `ingest_file`
+- `search_documents`
+
+Prefer `search_documents` over raw chunk search for normal use.
+
+## REST Communication
+
+Start REST API:
+
+```bash
+EMBEDDING_MODEL='Qwen/Qwen3-Embedding-4B' ./scripts/local-run-webui.sh
+```
+
+Health:
+
+```bash
 curl http://127.0.0.1:8765/health
 ```
 
-### Git remotes
+List models:
+
+```bash
+curl http://127.0.0.1:8765/embedding_models
 ```
-origin       → angrysky56/mcp-server-qdrant-enhanced (read-only upstream of fork chain)
-upstream     → qdrant/mcp-server-qdrant (original)
-macos-fork   → juangrukat/mcp-server-qdrant-enhanced-MacOS (this fork — push here)
+
+Create a 4B collection:
+
+```bash
+curl -X POST http://127.0.0.1:8765/collections \
+  -H 'Content-Type: application/json' \
+  --data '{"collection_name":"my_docs_qwen3_4b","embedding_model":"Qwen/Qwen3-Embedding-4B","distance":"cosine"}'
 ```
 
-The `master` branch tracks `macos-fork/master`.
+Switch active REST embedding model:
 
----
+```bash
+curl -X POST http://127.0.0.1:8765/embedding_models/active \
+  -H 'Content-Type: application/json' \
+  --data '{"model_name":"Qwen/Qwen3-Embedding-4B"}'
+```
 
-## 8. Decisions log
+Ingest one file:
 
-> Why we chose X over Y. Read this before "improving" something — the
-> alternative was probably already considered.
+```bash
+curl -X POST http://127.0.0.1:8765/ingest/file \
+  -H 'Content-Type: application/json' \
+  --data '{"file_path":"/absolute/path/to/file.pdf","collection_name":"my_docs_qwen3_4b"}'
+```
 
-| Decision | Why |
-|---|---|
-| fork name `mcp-server-qdrant-enhanced-MacOS` | macOS Spotlight integration is the differentiator; explicit OS suffix avoids confusion with the Linux/cross-platform parent fork |
-| public repo | builds on a public fork chain; private would be friction without benefit |
-| local working dir kept as `mcp-server-qdrant-enhanced/` | renaming risks tool calls and shell history |
-| logical commits, not one big commit | brief explicitly requested this; review-friendly |
-| fastmcp pinned `>=2.7,<3` | bounded but flexible; 2.8 verified to expose Streamable HTTP cleanly |
-| Streamable HTTP over SSE | spec-recommended for shared multi-client local servers |
-| `127.0.0.1` default bind | DNS rebinding mitigation; explicit override required for non-loopback |
-| Bearer token optional | defense in depth; MCP doesn't standardize auth, so we make it env-driven |
-| envelope `contract_version: "1.0"` fixed | bump on shape change; clients can rely on stability today |
-| Qwen3 surfaced via `SUPPLEMENTAL_MODELS` | fastembed's `list_supported_models()` doesn't always include feature-gated models; this is the cleanest fallback |
-| sparse default = `Qdrant/bm25` | lightweight, no model download; SPLADE++ is heavier and often not worth the trouble for general doc retrieval |
-| reranker default = `Xenova/ms-marco-MiniLM-L-6-v2` | fastembed-friendly, fast cross-encoder; Qwen3-Reranker-4B is a stub because it needs torch+transformers (not currently dependencies) |
-| `mcp_runtime/` submodule (not `mcp/`) | `mcp` would shadow the top-level `mcp` SDK package |
-| `set_collection_embedding_model` no longer mutates global state | multi-agent safety (intentional API change, documented) |
-| profile default = `canonical` | minimal is too restrictive for typical use; full is too loud; canonical is the curated daily surface |
-| report/apply only on `delete_collection` (required) and `ingest_folder` (opt-in) | brief scope; add others only when they exist and are meaningfully destructive |
-| `bootstrap_collection_indexes` NOT gated | idempotent; adding gating would be friction |
-| envelope migration is layered, not flag day | preserve backward compatibility on legacy `qdrant_find` / `qdrant_store` |
-| no tests this round | scope; budgeted for next session as Priority 2 |
+Search:
 
----
+```bash
+curl -X POST http://127.0.0.1:8765/search_documents \
+  -H 'Content-Type: application/json' \
+  --data '{"query":"your question","collection_name":"my_docs_qwen3_4b","limit":5,"chunks_per_document":2}'
+```
 
-## 9. How to start the next session
+## Key Fixes In This Session
 
-1. Read this file top-to-bottom.
-2. `git fetch macos-fork && git status` — confirm clean tree, nothing pending.
-3. Pick a Priority from §6. Don't skip P1/P2 unless you have a strong reason.
-4. For each commit you produce: keep it logical, single-purpose, with a
-   clear subject line and body. Match the existing style:
-   - `feat(area): subject` — new features
-   - `fix(area): subject` — bug fixes
-   - `docs(area): subject` — documentation only
-   - `test(area): subject` — tests only
-   - `refactor(area): subject` — restructure without behavior change
-5. Run smoke tests after each commit (see §7).
-6. When you finish a Priority, **update §4 and §6 in this file** to reflect
-   the new state. Bump `Last updated` at the top.
-7. Push to `macos-fork master`. Don't force-push.
+- Added `Qwen/Qwen3-Embedding-4B` as a first-class supported Qwen3 model.
+- Added Qwen3 response-buffer setting for large sidecar JSON responses.
+- Added per-call Qwen3 metrics logging.
+- Added password-protected PDF detection.
+- Reduced default ingest chunk size to 700 chars with 70 overlap.
+- Reduced default embedding batch size to 4.
+- Made `batch_store` upsert incrementally per embedding batch.
+- Fixed Qdrant local query shape:
+  - old: `query=(vector_name, vector)`
+  - new: `query=vector, using=vector_name`
 
----
+## Known Caveats
 
-## 10. Open questions for the human
+- PDF extraction can still produce ugly chunks, especially letter-spaced pages
+  or copyright/rubric pages. Retrieval works, but a future text-cleaning pass
+  would improve quality.
+- Qwen3 8B is too slow for book-scale local ingestion on this machine unless
+  quality needs justify hours of runtime.
+- Embedded Qdrant storage is single-process. Multi-agent launch should use
+  `QDRANT_MODE=server`/`QDRANT_URL=http://127.0.0.1:6333`.
+- The REST `/embedding_models/active` switch is process-global for REST. For MCP,
+  prefer per-collection model settings and per-request model overrides.
+- Existing staged files include user-modified `README.md`; do not assume all
+  staged changes are yours.
 
-These are decisions that need user input before they can be made:
+## Verification Commands
 
-1. **Schema-first or behavior-first for outputSchema?** Should we extend
-   the envelope to include schema URLs (`$id`) so clients can fetch them,
-   or keep schemas inline in `tools/list` only?
-2. **Should the default profile change?** Currently `canonical`. Some
-   deployments might want `minimal` as a stricter default for
-   agent-as-untrusted-client scenarios.
-3. **Is Qwen3-Reranker actually needed?** It requires adding
-   torch+transformers as a dependency (~4 GB install). The
-   FastEmbed cross-encoder default is fast and decent. Drop the Qwen3
-   reranker stub or commit to implementing it?
-4. **CI matrix.** Worth setting up GitHub Actions to run `pytest` on
-   ubuntu-latest + macos-latest? We have a `pytest.yaml` workflow but it
-   was pre-existing for the upstream fork — not validated.
-5. **Versioning.** `pyproject.toml` says `version = "0.7.1"` (inherited
-   from upstream). The envelope's `toolset_version` is `"0.8.0"`. Should
-   we bump pyproject to `0.8.0` and tag a release?
+```bash
+uv run --locked pytest
+curl http://127.0.0.1:8765/health
+curl http://127.0.0.1:8765/collections/socratic_circles_qwen3_4b
+```
 
----
+Expected latest full test result:
 
-*End of brief. Update §4, §6, and the timestamp when you finish work.*
+```text
+44 passed, 1 skipped
+```

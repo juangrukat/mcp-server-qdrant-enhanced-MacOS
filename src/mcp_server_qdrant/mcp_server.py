@@ -24,6 +24,7 @@ from mcp_server_qdrant.mcp_runtime.plan_registry import PlanRegistry
 from mcp_server_qdrant.mcp_runtime.profiles import ToolProfile, is_tool_visible
 from mcp_server_qdrant.mcp_runtime.provider_resolver import ProviderResolver
 from mcp_server_qdrant.mcp_runtime.schemas import TOOL_OUTPUT_SCHEMAS
+from mcp_server_qdrant.mcp_runtime.write_queue import WriteQueue, WriteQueueFullError
 from mcp_server_qdrant.qdrant import ArbitraryFilter, Entry, QdrantConnector, BatchEntry
 from mcp_server_qdrant.settings import (
     EmbeddingProviderSettings,
@@ -79,6 +80,13 @@ class QdrantMCPServer(FastMCP):
 
             # Plan registry for report/apply gating on mutating tools.
             self.plan_registry = PlanRegistry()
+
+            # Bounded write queue for embedding/upsert work. This keeps
+            # multi-agent ingestion from stampeding local embedding/Qdrant.
+            self.write_queue = WriteQueue(
+                max_concurrency=qdrant_settings.write_max_concurrency,
+                max_queue_size=qdrant_settings.write_queue_size,
+            )
 
             # Initialize Qdrant connector with secure connection handling
             self.qdrant_connector = self._create_secure_qdrant_connector()
@@ -245,7 +253,10 @@ class QdrantMCPServer(FastMCP):
                     id=entry_id
                 )
 
-                stored_count = await self.qdrant_connector.batch_store([batch_entry], collection_name)
+                stored_count = await self.write_queue.run(
+                    "qdrant_store",
+                    lambda: self.qdrant_connector.batch_store([batch_entry], collection_name),
+                )
 
                 if stored_count > 0:
                     # Record the model mapping for this collection if not already stored
@@ -843,7 +854,10 @@ class QdrantMCPServer(FastMCP):
                     # if len(batch_entries) > self.qdrant_settings.max_batch_size:
                     #     return f"Batch size {len(batch_entries)} exceeds maximum {self.qdrant_settings.max_batch_size}"
 
-                    stored_count = await self.qdrant_connector.batch_store(batch_entries, collection_name)
+                    stored_count = await self.write_queue.run(
+                        "qdrant_store_batch",
+                        lambda: self.qdrant_connector.batch_store(batch_entries, collection_name),
+                    )
 
                     if stored_count > 0:
                         return f"Successfully stored {stored_count} entries in collection '{collection_name}'"
@@ -934,18 +948,27 @@ class QdrantMCPServer(FastMCP):
                         for chunk in chunks
                     ]
                     if mode == "hybrid":
-                        stored = await self.qdrant_connector.batch_store_hybrid(
-                            batch_entries, collection_name, self.get_sparse_provider(),
-                            embedding_provider=request_provider,
+                        stored = await self.write_queue.run(
+                            "ingest_file",
+                            lambda: self.qdrant_connector.batch_store_hybrid(
+                                batch_entries, collection_name, self.get_sparse_provider(),
+                                embedding_provider=request_provider,
+                            ),
                         )
                     elif mode == "late_interaction":
                         late_provider = self.get_late_interaction_provider(late_interaction_model)
-                        stored = await self.qdrant_connector.batch_store_late_interaction(
-                            batch_entries, collection_name, late_provider
+                        stored = await self.write_queue.run(
+                            "ingest_file",
+                            lambda: self.qdrant_connector.batch_store_late_interaction(
+                                batch_entries, collection_name, late_provider
+                            ),
                         )
                     else:
-                        stored = await self.qdrant_connector.batch_store(
-                            batch_entries, collection_name, embedding_provider=request_provider
+                        stored = await self.write_queue.run(
+                            "ingest_file",
+                            lambda: self.qdrant_connector.batch_store(
+                                batch_entries, collection_name, embedding_provider=request_provider
+                            ),
                         )
 
                     acc.stats.update({
@@ -969,6 +992,9 @@ class QdrantMCPServer(FastMCP):
                         },
                         profile=profile,
                     )
+                except WriteQueueFullError as e:
+                    await ctx.debug(f"Write queue full while ingesting file: {e}")
+                    return failure_from(acc, code="write_queue_full", message=str(e), profile=profile, retryable=True)
                 except Exception as e:
                     await ctx.debug(f"Error ingesting file: {e}")
                     return failure_from(acc, code="internal_error", message=str(e), profile=profile, retryable=True)
@@ -1121,18 +1147,27 @@ class QdrantMCPServer(FastMCP):
                             for chunk in chunks
                         ]
                         if mode == "hybrid":
-                            stored = await self.qdrant_connector.batch_store_hybrid(
-                                batch_entries, collection_name, self.get_sparse_provider(),
-                                embedding_provider=request_provider,
+                            stored = await self.write_queue.run(
+                                "ingest_folder",
+                                lambda: self.qdrant_connector.batch_store_hybrid(
+                                    batch_entries, collection_name, self.get_sparse_provider(),
+                                    embedding_provider=request_provider,
+                                ),
                             )
                         elif mode == "late_interaction":
                             late_provider = self.get_late_interaction_provider(late_interaction_model)
-                            stored = await self.qdrant_connector.batch_store_late_interaction(
-                                batch_entries, collection_name, late_provider
+                            stored = await self.write_queue.run(
+                                "ingest_folder",
+                                lambda: self.qdrant_connector.batch_store_late_interaction(
+                                    batch_entries, collection_name, late_provider
+                                ),
                             )
                         else:
-                            stored = await self.qdrant_connector.batch_store(
-                                batch_entries, collection_name, embedding_provider=request_provider
+                            stored = await self.write_queue.run(
+                                "ingest_folder",
+                                lambda: self.qdrant_connector.batch_store(
+                                    batch_entries, collection_name, embedding_provider=request_provider
+                                ),
                             )
                         total_chunks += stored
                         total_files += 1

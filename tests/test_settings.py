@@ -20,6 +20,8 @@ class TestQdrantSettings:
         settings = QdrantSettings()
         assert settings.collection_name == DEFAULT_COLLECTION_NAME
         assert settings.local_path == DEFAULT_LOCAL_STORAGE_PATH
+        assert settings.write_max_concurrency == 1
+        assert settings.write_queue_size == 8
 
     def test_minimal_config(self, monkeypatch):
         """Test loading minimal configuration from environment variables."""
@@ -39,6 +41,8 @@ class TestQdrantSettings:
         monkeypatch.setenv("COLLECTION_NAME", "my_memories")
         monkeypatch.setenv("QDRANT_SEARCH_LIMIT", "15")
         monkeypatch.setenv("QDRANT_READ_ONLY", "1")
+        monkeypatch.setenv("QDRANT_WRITE_MAX_CONCURRENCY", "2")
+        monkeypatch.setenv("QDRANT_WRITE_QUEUE_SIZE", "12")
 
         settings = QdrantSettings()
         assert settings.location == "http://qdrant.example.com:6333"
@@ -46,6 +50,8 @@ class TestQdrantSettings:
         assert settings.collection_name == "my_memories"
         assert settings.search_limit == 15
         assert settings.read_only is True
+        assert settings.write_max_concurrency == 2
+        assert settings.write_queue_size == 12
 
     def test_local_path_config(self, monkeypatch):
         """Test loading local path configuration from environment variables."""
@@ -73,17 +79,23 @@ class TestEmbeddingProviderSettings:
         """Test default values are set correctly."""
         settings = EmbeddingProviderSettings()
         assert settings.provider_type == EmbeddingProviderType.FASTEMBED
-        assert settings.model_name == "sentence-transformers/all-MiniLM-L6-v2"
-        assert settings.device == "cpu"
+        assert settings.model_name == "Qwen/Qwen3-Embedding-8B"
+        assert settings.device == "auto"
+        assert settings.qwen3_metrics_path is None
+        assert settings.qwen3_response_limit_bytes == 64 * 1024 * 1024
 
     def test_custom_values(self, monkeypatch):
         """Test loading custom values from environment variables."""
         monkeypatch.setenv("EMBEDDING_MODEL", "custom_model")
         monkeypatch.setenv("EMBEDDING_DEVICE", "mps")
+        monkeypatch.setenv("QWEN3_METRICS_PATH", "/tmp/qwen3-metrics.jsonl")
+        monkeypatch.setenv("QWEN3_RESPONSE_LIMIT_BYTES", "123456")
         settings = EmbeddingProviderSettings()
         assert settings.provider_type == EmbeddingProviderType.FASTEMBED
         assert settings.model_name == "custom_model"
         assert settings.device == "mps"
+        assert settings.qwen3_metrics_path == "/tmp/qwen3-metrics.jsonl"
+        assert settings.qwen3_response_limit_bytes == 123456
 
 
 class TestToolSettings:

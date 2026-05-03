@@ -10,6 +10,7 @@ Priority per format:
 import csv
 import json
 import logging
+import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -30,9 +31,10 @@ PLAIN_TEXT_EXTENSIONS = {
 STRUCTURED_TEXT_EXTENSIONS = {".json", ".jsonl", ".csv", ".tsv"}
 SUPPORTED_EXTENSIONS = PLAIN_TEXT_EXTENSIONS | STRUCTURED_TEXT_EXTENSIONS | {".pdf", ".docx"}
 
-# Max chars per chunk; overlap in chars
-CHUNK_SIZE = 1500
-CHUNK_OVERLAP = 150
+# Max chars per chunk; overlap in chars. Qwen3/Candle is sensitive to inputs
+# that exceed its tokenizer split limits, so keep local chunks conservative.
+DEFAULT_CHUNK_SIZE = 700
+DEFAULT_CHUNK_OVERLAP = 70
 
 
 @dataclass
@@ -49,6 +51,8 @@ class PdfProfile:
     has_text: bool
     has_images: bool
     is_probably_scanned: bool
+    is_encrypted: bool
+    requires_password: bool
     pages_with_text: list[int]
     pages_sampled: int
     page_count: int
@@ -91,19 +95,25 @@ def build_chunks(doc: ExtractedDocument, file_metadata: dict) -> list[Chunk]:
     Split extracted text into overlapping chunks.
     Splits on paragraph boundaries first, then hard-cuts long paragraphs.
     """
+    chunk_size = _env_int("QDRANT_INGEST_CHUNK_SIZE", DEFAULT_CHUNK_SIZE)
+    chunk_overlap = min(
+        _env_int("QDRANT_INGEST_CHUNK_OVERLAP", DEFAULT_CHUNK_OVERLAP),
+        max(0, chunk_size - 1),
+    )
+    stride = max(1, chunk_size - chunk_overlap)
     paragraphs = [p.strip() for p in re.split(r"\n{2,}", doc.text) if p.strip()]
     raw_chunks: list[str] = []
     current = ""
 
     for para in paragraphs:
-        if len(para) > CHUNK_SIZE:
+        if len(para) > chunk_size:
             # Hard split the oversized paragraph
             if current:
                 raw_chunks.append(current)
                 current = ""
-            for i in range(0, len(para), CHUNK_SIZE - CHUNK_OVERLAP):
-                raw_chunks.append(para[i : i + CHUNK_SIZE])
-        elif len(current) + len(para) + 2 > CHUNK_SIZE:
+            for i in range(0, len(para), stride):
+                raw_chunks.append(para[i : i + chunk_size])
+        elif len(current) + len(para) + 2 > chunk_size:
             raw_chunks.append(current)
             current = para
         else:
@@ -118,6 +128,17 @@ def build_chunks(doc: ExtractedDocument, file_metadata: dict) -> list[Chunk]:
         chunk_meta = {**file_metadata, "chunk_index": i, "total_chunks": total}
         chunks.append(Chunk(text=text, chunk_index=i, total_chunks=total, metadata=chunk_meta))
     return chunks
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if not raw:
+        return default
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        logger.warning("Invalid %s=%r; using %s", name, raw, default)
+        return default
 
 
 # --- Plain text ---
@@ -242,6 +263,14 @@ def _json_to_searchable_text(value: Any, *, prefix: str = "") -> str:
 
 def _extract_pdf(path: str) -> ExtractedDocument:
     profile = profile_pdf(path)
+    if profile.requires_password:
+        return ExtractedDocument(
+            text="",
+            extractor_used="pdf-preflight",
+            char_count=0,
+            page_count=profile.page_count,
+            error="PDF is encrypted/password-protected and cannot be ingested without a password.",
+        )
     if profile.is_probably_scanned:
         return ExtractedDocument(
             text="",
@@ -271,6 +300,24 @@ def profile_pdf(path: str, *, sample_pages: int = 5, text_threshold: int = 16) -
         from pypdf import PdfReader
 
         reader = PdfReader(path)
+        if reader.is_encrypted:
+            try:
+                decrypt_result = reader.decrypt("")
+            except Exception:
+                decrypt_result = 0
+            if not decrypt_result:
+                return PdfProfile(
+                    has_text=False,
+                    has_images=False,
+                    is_probably_scanned=False,
+                    is_encrypted=True,
+                    requires_password=True,
+                    pages_with_text=[],
+                    pages_sampled=0,
+                    page_count=0,
+                    error="PDF is encrypted/password-protected.",
+                )
+
         page_count = len(reader.pages)
         pages_to_sample = min(sample_pages, page_count)
         has_images = False
@@ -299,6 +346,8 @@ def profile_pdf(path: str, *, sample_pages: int = 5, text_threshold: int = 16) -
             has_text=has_text,
             has_images=has_images,
             is_probably_scanned=has_images and not has_text and pages_to_sample > 0,
+            is_encrypted=reader.is_encrypted,
+            requires_password=False,
             pages_with_text=pages_with_text,
             pages_sampled=pages_to_sample,
             page_count=page_count,
@@ -309,6 +358,8 @@ def profile_pdf(path: str, *, sample_pages: int = 5, text_threshold: int = 16) -
             has_text=False,
             has_images=False,
             is_probably_scanned=False,
+            is_encrypted=False,
+            requires_password=False,
             pages_with_text=[],
             pages_sampled=0,
             page_count=0,

@@ -8,6 +8,7 @@ from mcp_server_qdrant.embeddings.base import EmbeddingProvider
 # Fallback dimensions for models that may not appear in fastembed's registry
 KNOWN_MODEL_DIMS: dict[str, int] = {
     "Qwen/Qwen3-Embedding-8B": 4096,
+    "Qwen/Qwen3-Embedding-4B": 2560,
     "Qwen/Qwen3-Embedding-0.6B": 1024,
 }
 

@@ -1,4 +1,5 @@
 import logging
+import os
 import uuid
 from typing import Any
 
@@ -9,9 +10,26 @@ from mcp_server_qdrant.embeddings.base import EmbeddingProvider
 from mcp_server_qdrant.settings import METADATA_PATH
 
 logger = logging.getLogger(__name__)
+DEFAULT_EMBEDDING_BATCH_SIZE = 4
 
 Metadata = dict[str, Any]
 ArbitraryFilter = dict[str, Any]
+
+
+def _embedding_batch_size() -> int:
+    raw = os.getenv("QDRANT_EMBEDDING_BATCH_SIZE")
+    if not raw:
+        return DEFAULT_EMBEDDING_BATCH_SIZE
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        logger.warning(
+            "Invalid QDRANT_EMBEDDING_BATCH_SIZE=%r; using %s",
+            raw,
+            DEFAULT_EMBEDDING_BATCH_SIZE,
+        )
+        return DEFAULT_EMBEDDING_BATCH_SIZE
+
 
 class CollectionInfo(BaseModel):
     """Information about a Qdrant collection."""
@@ -179,7 +197,8 @@ class QdrantConnector:
         # Use modern Query API with client-side embedding
         search_results_raw = await self._client.query_points(
             collection_name=collection_name,
-            query=(provider.get_vector_name(), query_vector),
+            query=query_vector,
+            using=provider.get_vector_name(),
             limit=limit,
             query_filter=query_filter,
             with_payload=True,
@@ -385,39 +404,55 @@ class QdrantConnector:
         await self._ensure_collection_exists(collection_name, embedding_provider=provider)
 
         try:
-            points = []
-            documents = [entry.content for entry in entries]
-            embeddings = await provider.embed_documents(documents)
-
-            for i, entry in enumerate(entries):
-                if entry.id:
-                    try:
-                        point_id = str(uuid.UUID(entry.id)).replace("-", "")
-                    except ValueError:
-                        point_id = uuid.uuid5(uuid.NAMESPACE_DNS, entry.id).hex
-                else:
-                    point_id = uuid.uuid4().hex
-
-                points.append(
-                    models.PointStruct(
-                        id=point_id,
-                        payload={"document": entry.content, METADATA_PATH: entry.metadata or {}},
-                        vector={provider.get_vector_name(): embeddings[i]},
+            batch_size = _embedding_batch_size()
+            stored = 0
+            for start in range(0, len(entries), batch_size):
+                entry_batch = entries[start : start + batch_size]
+                documents = [entry.content for entry in entry_batch]
+                try:
+                    embeddings = await provider.embed_documents(documents)
+                except Exception as e:
+                    logger.error(
+                        "Error embedding batch %s-%s of %s in collection %r: %s",
+                        start,
+                        min(start + batch_size, len(documents)),
+                        len(documents),
+                        collection_name,
+                        e,
                     )
+                    raise
+
+                points = []
+                for i, entry in enumerate(entry_batch):
+                    if entry.id:
+                        try:
+                            point_id = str(uuid.UUID(entry.id)).replace("-", "")
+                        except ValueError:
+                            point_id = uuid.uuid5(uuid.NAMESPACE_DNS, entry.id).hex
+                    else:
+                        point_id = uuid.uuid4().hex
+
+                    points.append(
+                        models.PointStruct(
+                            id=point_id,
+                            payload={"document": entry.content, METADATA_PATH: entry.metadata or {}},
+                            vector={provider.get_vector_name(): embeddings[i]},
+                        )
+                    )
+
+                await self._client.upsert(
+                    collection_name=collection_name,
+                    points=points,
+                    wait=True,
                 )
+                stored += len(points)
 
-            await self._client.upsert(
-                collection_name=collection_name,
-                points=points,
-                wait=True,
-            )
-
-            logger.info(f"Successfully stored {len(entries)} entries in collection '{collection_name}'.")
-            return len(entries)
+            logger.info(f"Successfully stored {stored} entries in collection '{collection_name}'.")
+            return stored
 
         except Exception as e:
             logger.error(f"Error in batch store: {e}")
-            return 0
+            return stored if "stored" in locals() else 0
 
     async def scroll_collection(
         self,
@@ -540,7 +575,8 @@ class QdrantConnector:
 
         search_results_raw = await self._client.query_points(
             collection_name=collection_name,
-            query=(provider.get_vector_name(), query_vector),
+            query=query_vector,
+            using=provider.get_vector_name(),
             limit=limit,
             query_filter=query_filter,
             with_payload=True,

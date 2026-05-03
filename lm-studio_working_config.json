@@ -4,14 +4,16 @@
       "command": "uv",
       "args": [
         "--directory",
-        "/Users/YOUR_USERNAME/path/to/mcp-server-qdrant-enhanced-MacOS",
+        "/path/to/mcp-server-qdrant-enhanced",
         "run",
+        "--locked",
         "mcp-server-qdrant",
         "--transport",
         "stdio"
       ],
       "env": {
-        "QDRANT_LOCAL_PATH": "/Users/YOUR_USERNAME/qdrant-data",
+        "QDRANT_MODE": "server",
+        "QDRANT_URL": "http://127.0.0.1:6333",
         "EMBEDDING_PROVIDER": "fastembed",
         "EMBEDDING_MODEL": "sentence-transformers/all-MiniLM-L6-v2",
         "COLLECTION_NAME": "lm_studio_memories",

@@ -4,12 +4,14 @@
       "command": "uv",
       "args": [
         "--directory",
-        "/Users/YOUR_USERNAME/path/to/mcp-server-qdrant-enhanced-MacOS",
+        "/path/to/mcp-server-qdrant-enhanced",
         "run",
+        "--locked",
         "mcp-server-qdrant"
       ],
       "env": {
-        "QDRANT_URL": "http://localhost:6333",
+        "QDRANT_MODE": "server",
+        "QDRANT_URL": "http://127.0.0.1:6333",
         "EMBEDDING_PROVIDER": "fastembed",
         "EMBEDDING_MODEL": "sentence-transformers/all-MiniLM-L6-v2",
         "QDRANT_ENABLE_COLLECTION_MANAGEMENT": "true",
@@ -24,12 +26,14 @@
       "command": "uv",
       "args": [
         "--directory",
-        "/Users/YOUR_USERNAME/path/to/mcp-server-qdrant-enhanced-MacOS",
+        "/path/to/mcp-server-qdrant-enhanced",
         "run",
+        "--locked",
         "mcp-server-qdrant"
       ],
       "env": {
-        "QDRANT_URL": "http://localhost:6333",
+        "QDRANT_MODE": "server",
+        "QDRANT_URL": "http://127.0.0.1:6333",
         "EMBEDDING_PROVIDER": "fastembed",
         "EMBEDDING_MODEL": "Qwen/Qwen3-Embedding-8B",
         "QDRANT_ENABLE_COLLECTION_MANAGEMENT": "true",

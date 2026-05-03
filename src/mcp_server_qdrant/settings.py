@@ -121,13 +121,30 @@ class EmbeddingProviderSettings(BaseSettings):
         validation_alias="EMBEDDING_PROVIDER",
     )
     model_name: str = Field(
-        default="sentence-transformers/all-MiniLM-L6-v2",
+        default="Qwen/Qwen3-Embedding-8B",
         validation_alias="EMBEDDING_MODEL",
     )
     device: str = Field(
-        default="cpu",
+        default="auto",
         validation_alias="EMBEDDING_DEVICE",
-        description="FastEmbed device, e.g. cpu, cuda, or mps when supported by the local runtime.",
+        description="Embedding device, e.g. auto, cpu, cuda, mps, or metal when supported by the local runtime.",
+    )
+    qwen3_sidecar_path: str | None = Field(
+        default=None,
+        validation_alias="QWEN3_SIDECAR_PATH",
+        description="Optional path to the Rust Qwen3 sidecar binary.",
+    )
+    qwen3_max_length: int = Field(default=1024, validation_alias="QWEN3_MAX_LENGTH")
+    qwen3_dtype: str = Field(default="auto", validation_alias="QWEN3_DTYPE")
+    qwen3_response_limit_bytes: int = Field(
+        default=64 * 1024 * 1024,
+        validation_alias="QWEN3_RESPONSE_LIMIT_BYTES",
+        description="Async stdout read limit for large Qwen3 sidecar JSON embedding responses.",
+    )
+    qwen3_metrics_path: str | None = Field(
+        default=None,
+        validation_alias="QWEN3_METRICS_PATH",
+        description="Optional JSONL path for Qwen3 embedding timing metrics.",
     )
 
 
@@ -206,6 +223,16 @@ class QdrantSettings(BaseSettings):
     max_batch_size: int = Field(
         default=10000, validation_alias="QDRANT_MAX_BATCH_SIZE",
         description="Maximum batch size for operations. Default is 10000 (effectively unlimited for most use cases)"
+    )
+    write_max_concurrency: int = Field(
+        default=1,
+        validation_alias="QDRANT_WRITE_MAX_CONCURRENCY",
+        description="Maximum concurrent embedding/upsert write jobs per server process.",
+    )
+    write_queue_size: int = Field(
+        default=8,
+        validation_alias="QDRANT_WRITE_QUEUE_SIZE",
+        description="Maximum queued write jobs waiting for an embedding/upsert slot.",
     )
 
     enable_resources: bool = Field(

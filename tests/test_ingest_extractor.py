@@ -1,7 +1,13 @@
 import json
 
 from mcp_server_qdrant.ingest import extractor
-from mcp_server_qdrant.ingest.extractor import SUPPORTED_EXTENSIONS, PdfProfile, extract_text
+from mcp_server_qdrant.ingest.extractor import (
+    SUPPORTED_EXTENSIONS,
+    ExtractedDocument,
+    PdfProfile,
+    build_chunks,
+    extract_text,
+)
 
 
 def test_json_is_rendered_as_searchable_path_value_text(tmp_path):
@@ -45,6 +51,21 @@ def test_plain_textish_extensions_are_supported(tmp_path):
     assert "service: qdrant" in doc.text
 
 
+def test_build_chunks_uses_conservative_env_chunk_size(monkeypatch):
+    monkeypatch.setenv("QDRANT_INGEST_CHUNK_SIZE", "20")
+    monkeypatch.setenv("QDRANT_INGEST_CHUNK_OVERLAP", "5")
+    doc = ExtractedDocument(
+        text="abcdefghijklmnopqrstuvwxyz",
+        extractor_used="test",
+        char_count=26,
+    )
+
+    chunks = build_chunks(doc, {"source": "unit"})
+
+    assert [chunk.text for chunk in chunks] == ["abcdefghijklmnopqrst", "pqrstuvwxyz"]
+    assert chunks[0].metadata["total_chunks"] == 2
+
+
 def test_docx_tables_are_extracted_in_document_order(tmp_path):
     from docx import Document
 
@@ -80,6 +101,8 @@ def test_scanned_pdf_preflight_skips_full_text_extractors(monkeypatch, tmp_path)
             has_text=False,
             has_images=True,
             is_probably_scanned=True,
+            is_encrypted=False,
+            requires_password=False,
             pages_with_text=[],
             pages_sampled=1,
             page_count=1,
@@ -98,3 +121,32 @@ def test_scanned_pdf_preflight_skips_full_text_extractors(monkeypatch, tmp_path)
     assert doc.page_count == 1
     assert doc.char_count == 0
     assert "OCR is not implemented" in doc.error
+
+
+def test_password_protected_pdf_fails_before_extraction(monkeypatch):
+    monkeypatch.setattr(
+        extractor,
+        "profile_pdf",
+        lambda _: PdfProfile(
+            has_text=False,
+            has_images=False,
+            is_probably_scanned=False,
+            is_encrypted=True,
+            requires_password=True,
+            pages_with_text=[],
+            pages_sampled=0,
+            page_count=0,
+        ),
+    )
+
+    def fail_if_called(_):
+        raise AssertionError("encrypted PDF should not be extracted")
+
+    monkeypatch.setattr(extractor, "_pdf_pdfminer", fail_if_called)
+    monkeypatch.setattr(extractor, "_pdf_pypdf", fail_if_called)
+
+    doc = extractor._extract_pdf("/tmp/encrypted.pdf")
+
+    assert doc.extractor_used == "pdf-preflight"
+    assert doc.char_count == 0
+    assert "password-protected" in doc.error

@@ -15,6 +15,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from mcp_server_qdrant.embedding_manager import EnhancedEmbeddingModelManager
+from mcp_server_qdrant.mcp_runtime.write_queue import WriteQueue, WriteQueueFullError
 from mcp_server_qdrant.qdrant import BatchEntry, QdrantConnector
 from mcp_server_qdrant.settings import (
     EmbeddingProviderSettings,
@@ -98,6 +99,10 @@ def create_app(
         embedding_provider=embedding_provider,
         qdrant_local_path=qdrant_settings.local_path,
     )
+    write_queue = WriteQueue(
+        max_concurrency=qdrant_settings.write_max_concurrency,
+        max_queue_size=qdrant_settings.write_queue_size,
+    )
 
     app = FastAPI(
         title="mcp-server-qdrant-enhanced-MacOS",
@@ -117,10 +122,12 @@ def create_app(
 
     @app.get("/health")
     async def health() -> dict:
+        queue_stats = await write_queue.stats()
         return {
             "status": "ok",
             "embedding_model": embedding_provider.get_model_name(),
             "vector_size": embedding_provider.get_vector_size(),
+            "write_queue": queue_stats.__dict__,
         }
 
     # --- Collections ---
@@ -183,7 +190,13 @@ def create_app(
     @app.post("/store")
     async def store(req: StoreRequest) -> dict:
         entry = BatchEntry(content=req.content, metadata=req.metadata, id=req.entry_id)
-        n = await connector.batch_store([entry], req.collection_name)
+        try:
+            n = await write_queue.run(
+                "store",
+                lambda: connector.batch_store([entry], req.collection_name),
+            )
+        except WriteQueueFullError as e:
+            raise HTTPException(status_code=429, detail=str(e)) from e
         return {"stored": n}
 
     @app.post("/store_batch")
@@ -197,7 +210,13 @@ def create_app(
             for e in req.entries
             if "content" in e
         ]
-        n = await connector.batch_store(entries, req.collection_name)
+        try:
+            n = await write_queue.run(
+                "store_batch",
+                lambda: connector.batch_store(entries, req.collection_name),
+            )
+        except WriteQueueFullError as e:
+            raise HTTPException(status_code=429, detail=str(e)) from e
         return {"stored": n}
 
     @app.get("/scroll/{name}")
@@ -293,7 +312,13 @@ def create_app(
         await connector.ensure_macos_metadata_indexes(req.collection_name)
         chunks = build_chunks(doc, file_meta)
         entries = [BatchEntry(content=c.text, metadata=c.metadata) for c in chunks]
-        stored = await connector.batch_store(entries, req.collection_name)
+        try:
+            stored = await write_queue.run(
+                "ingest_file",
+                lambda: connector.batch_store(entries, req.collection_name),
+            )
+        except WriteQueueFullError as e:
+            raise HTTPException(status_code=429, detail=str(e)) from e
         return {
             "filename": path.name,
             "chunks_stored": stored,
@@ -355,9 +380,14 @@ def create_app(
 
                 chunks = build_chunks(doc, file_meta)
                 entries = [BatchEntry(content=c.text, metadata=c.metadata) for c in chunks]
-                stored = await connector.batch_store(entries, req.collection_name)
+                stored = await write_queue.run(
+                    "ingest_folder",
+                    lambda: connector.batch_store(entries, req.collection_name),
+                )
                 total_chunks += stored
                 files_done += 1
+            except WriteQueueFullError as e:
+                raise HTTPException(status_code=429, detail=str(e)) from e
             except Exception as e:
                 errors.append({"file": str(path), "error": str(e)})
 

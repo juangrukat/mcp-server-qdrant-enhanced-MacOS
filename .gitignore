@@ -163,5 +163,10 @@ cython_debug/
 
 # Project-specific settings
 .aider*
+.DS_Store
+src/.DS_Store
+.local/
+storage/
+logs/
 src/qdrant_data/
 qdrant_storage.DS_Store
