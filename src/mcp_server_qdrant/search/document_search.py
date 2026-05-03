@@ -28,7 +28,7 @@ async def search_documents_grouped(
     collection_name: str,
     *,
     limit: int = 10,
-    chunks_per_document: int = 1,
+    chunks_per_document: int = 4,
     query_filter: models.Filter | None = None,
     min_score: float | None = None,
     sparse_provider: Any = None,

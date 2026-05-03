@@ -452,7 +452,7 @@ Search by distinct document:
 ```bash
 curl -X POST http://127.0.0.1:8765/search_documents \
   -H 'Content-Type: application/json' \
-  --data '{"query":"What is the main argument?","collection_name":"my_docs_qwen3_4b","limit":5,"chunks_per_document":2}'
+  --data '{"query":"What is the main argument?","collection_name":"my_docs_qwen3_4b","limit":5,"chunks_per_document":4}'
 ```
 
 ## MCP tool profiles
@@ -516,7 +516,7 @@ Arguments:
 - `collection_name`: collection to search.
 - `limit`: number of distinct documents to return. Default: `10`.
 - `chunks_per_document`: number of best chunks to include per document.
-  Default: `1`.
+  Default: `4`.
 - `filter`: optional high-level filter object.
 - `mode`: `dense`, `hybrid`, `rerank`, or `late_interaction`.
 - `reranker_model`: optional reranker for `mode="rerank"`.
@@ -638,7 +638,9 @@ metadata fields.
 ### Embedding model tools
 
 `list_embedding_models` asks FastEmbed for supported dense models and appends
-supplemental Qwen3 entries.
+supplemental Qwen3 entries. FastEmbed-reported BGE v1.5 models are selectable
+when they appear in that list; BGE-M3 is not currently an implemented provider
+path in this project.
 
 The supplemental Qwen3 entries are:
 
@@ -649,6 +651,10 @@ The supplemental Qwen3 entries are:
 `set_collection_embedding_model` switches the active provider for subsequent
 store and search operations for that collection. Assignments are persisted to
 `<storage>/collection_models.json` and reloaded on server startup.
+
+Changing the active model does not re-embed existing vectors. If a collection
+was created with Qwen3 4B vectors, use a new BGE collection and re-ingest the
+documents before searching with a BGE model.
 
 ### Raw tools
 
@@ -870,7 +876,8 @@ For strict exclusion on array fields, prefer `must_not` with `any`.
 
 ## Embedding models
 
-The only implemented embedding provider type is FastEmbed. The test suite also
+The implemented dense provider path is FastEmbed, with a local Qwen3 sidecar
+for the supplemental Qwen3 model names listed below. The test suite also
 contains an optional FlagEmbedding/BGE smoke test; it skips automatically unless
 `FlagEmbedding` is installed.
 
@@ -885,9 +892,30 @@ Supplemental model entries added by this project:
 | Model | Dimensions | Notes |
 | --- | ---: | --- |
 | `Qwen/Qwen3-Embedding-0.6B` | 1024 | lightweight Qwen3 embedding model |
+| `Qwen/Qwen3-Embedding-4B` | 2560 | practical local book-scale default on Apple Silicon |
 | `Qwen/Qwen3-Embedding-8B` | 4096 | larger multilingual/code retrieval model |
 
 The server also lists models reported by `fastembed.TextEmbedding`.
+
+### BGE status
+
+BGE v1.5 models reported by FastEmbed are selectable, for example:
+
+- `BAAI/bge-small-en`
+- `BAAI/bge-small-en-v1.5`
+- `BAAI/bge-base-en`
+- `BAAI/bge-base-en-v1.5`
+- `BAAI/bge-large-en-v1.5`
+- `BAAI/bge-small-zh-v1.5`
+
+They are not active for a collection unless that collection is created or
+assigned with a BGE model and the source documents are embedded with that same
+model. Existing Qwen3 collections keep their Qwen3 vector names and dimensions.
+
+`BAAI/bge-m3` is not currently listed by the installed FastEmbed registry, and
+the optional FlagEmbedding smoke test is not a production provider integration.
+Use FlagEmbedding directly, or add a dedicated provider implementation, before
+promising BGE-M3 retrieval.
 
 Optional compatibility smoke:
 
@@ -924,6 +952,7 @@ Core environment variables:
 | `QDRANT_API_KEY` | unset | Qdrant API key |
 | `QDRANT_LOCAL_PATH` | `<repo>/storage`, or `.local/qdrant-storage` in embedded local scripts | Embedded local-mode storage path; leave unset when `QDRANT_URL` is set |
 | `QDRANT_DOCKER_STORAGE_PATH` | `.local/qdrant-server-storage` in docker local scripts | Qdrant server Docker volume path |
+| `QDRANT_IMAGE` | `qdrant/qdrant:v1.17.1` | Local Docker server image, pinned to match the Python client minor version |
 | `COLLECTION_NAME` | `documents` | Optional default collection |
 | `EMBEDDING_PROVIDER` | `fastembed` | Embedding provider type |
 | `EMBEDDING_MODEL` | `Qwen/Qwen3-Embedding-8B` | Active dense embedding model |

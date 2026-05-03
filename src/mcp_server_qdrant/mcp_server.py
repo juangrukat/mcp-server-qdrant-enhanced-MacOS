@@ -636,7 +636,7 @@ class QdrantMCPServer(FastMCP):
             query: Annotated[str, Field(description="Semantic search query")],
             collection_name: Annotated[str | None, Field(description="Collection to search; defaults to configured collection")] = None,
             limit: Annotated[int, Field(description="Number of distinct documents to return")] = 10,
-            chunks_per_document: Annotated[int, Field(description="Best chunks to surface per document")] = 1,
+            chunks_per_document: Annotated[int, Field(description="Best chunks to surface per document")] = 4,
             filter: Annotated[dict | None, Field(description="High-level filter: {must, should, must_not}")] = None,
             mode: Annotated[str, Field(description="'dense' | 'hybrid' | 'rerank' | 'late_interaction'")] = "dense",
             reranker_model: Annotated[str | None, Field(description="Reranker for mode='rerank' (default Xenova/ms-marco-MiniLM-L-6-v2)")] = None,
@@ -699,6 +699,15 @@ class QdrantMCPServer(FastMCP):
                     for d in docs:
                         best = d["chunks"][0] if d["chunks"] else None
                         snippet = (best["content"][:500] if best else "")
+                        chunks = [
+                            {
+                                "content": chunk["content"],
+                                "score": chunk["score"],
+                                "chunk_index": chunk.get("chunk_index"),
+                                "metadata": chunk.get("metadata") or {},
+                            }
+                            for chunk in d["chunks"]
+                        ]
                         results.append({
                             "document_id": d["document_id"],
                             "path": d.get("path") or "",
@@ -707,6 +716,7 @@ class QdrantMCPServer(FastMCP):
                             "snippet": snippet,
                             "score": d["score"],
                             "chunk_count": len(d["chunks"]),
+                            "chunks": chunks,
                             "metadata": (best["metadata"] if best else {}) or {},
                         })
 

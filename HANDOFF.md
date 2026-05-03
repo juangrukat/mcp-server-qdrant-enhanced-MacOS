@@ -16,12 +16,20 @@ The active local REST API was last verified at:
 - Docs: `http://127.0.0.1:8765/docs`
 - Active model: `Qwen/Qwen3-Embedding-4B`
 - Vector size: `2560`
-- Test result: `44 passed, 1 skipped`
+- Test result: `52 passed, 1 skipped`
 
 The optional skipped test is:
 
 - `tests/test_flagembedding_optional.py`
 - Reason: `FlagEmbedding` is optional; it skips a BGE compatibility smoke test.
+
+BGE status for launch:
+
+- FastEmbed-listed BGE v1.5 models are selectable when returned by
+  `list_embedding_models`.
+- `BAAI/bge-m3` is not currently an implemented provider path.
+- Existing local data is Qwen3-embedded; switching to BGE requires a new
+  collection and re-ingestion so vector names and dimensions match.
 
 ## Important Runtime State
 
@@ -38,6 +46,8 @@ Useful local files:
 - Metrics JSONL: `.local/logs/qwen3-embeddings.jsonl`
 - Embedded Qdrant storage: `.local/qdrant-storage` for one-process local mode
 - Qdrant server storage: `.local/qdrant-server-storage` when using Docker server mode
+- Docker image default: `qdrant/qdrant:v1.17.1`, matching the pinned
+  `qdrant-client` minor version.
 
 ## Local Scripts
 
@@ -304,7 +314,7 @@ Search:
 ```bash
 curl -X POST http://127.0.0.1:8765/search_documents \
   -H 'Content-Type: application/json' \
-  --data '{"query":"your question","collection_name":"my_docs_qwen3_4b","limit":5,"chunks_per_document":2}'
+  --data '{"query":"your question","collection_name":"my_docs_qwen3_4b","limit":5,"chunks_per_document":4}'
 ```
 
 ## Key Fixes In This Session

@@ -5,7 +5,7 @@ PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LOCAL_ROOT="${PROJECT_ROOT}/.local"
 STORAGE_PATH="${QDRANT_DOCKER_STORAGE_PATH:-${LOCAL_ROOT}/qdrant-server-storage}"
 CONTAINER_NAME="${QDRANT_CONTAINER_NAME:-qdrant_mcp_server}"
-IMAGE="${QDRANT_IMAGE:-qdrant/qdrant}"
+IMAGE="${QDRANT_IMAGE:-qdrant/qdrant:v1.17.1}"
 
 mkdir -p "${STORAGE_PATH}"
 

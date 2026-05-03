@@ -24,3 +24,8 @@ def test_priority_tools_have_output_schemas(monkeypatch):
         assert name in tools
         assert tools[name].output_schema
         assert tools[name].output_schema["type"] == "object"
+
+    search_data = tools["search_documents"].output_schema["properties"]["data"]
+    result_schema = search_data["properties"]["results"]["items"]
+    assert "chunks" in result_schema["properties"]
+    assert "content" in result_schema["properties"]["chunks"]["items"]["properties"]

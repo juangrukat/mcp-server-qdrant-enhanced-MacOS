@@ -56,7 +56,7 @@ class SearchDocumentsRequest(BaseModel):
     query: str
     collection_name: str
     limit: int = 10
-    chunks_per_document: int = 1
+    chunks_per_document: int = 4
     filter: Optional[dict] = None
 
 
