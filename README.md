@@ -127,6 +127,57 @@ The FastAPI app mirrors the main capabilities for JSON HTTP callers:
 | `GET /embedding_models` | List available embedding models. |
 | `POST /embedding_models/active` | Change the active REST embedding provider. |
 
+### Quick Start with Config File
+
+The easiest way to get running is with the configuration file:
+
+```bash
+# 1. Copy and edit the config
+cp qdrant-enhanced.yaml ~/.config/mcp-server-qdrant/config.yaml
+
+# 2. Start Qdrant (native binary or Docker)
+./scripts/local-run-qdrant.sh
+
+# 3. Start the MCP server — reads config automatically
+./scripts/run-server-mcp.sh --transport streamable-http
+```
+
+## Configuration
+
+All settings are consolidated in a single YAML file.
+
+### Config file location
+
+The first file found is used (priority order):
+1. `$QDRANT_CONFIG` environment variable
+2. `./qdrant-enhanced.yaml` (relative to working directory)
+3. `~/.config/mcp-server-qdrant/config.yaml`
+
+### Priority chain
+
+```
+CLI args / request params
+  → environment variables
+    → config file (qdrant-enhanced.yaml)
+      → built-in defaults
+```
+
+Environment variables always override the config file. Set `QDRANT_MODE=embedded`
+to override `qdrant-enhanced.yaml` without editing it.
+
+### Config reference
+
+See `qdrant-enhanced.yaml` in the repo root for a fully annotated example.
+Key sections:
+
+| Section | Controls |
+|---------|----------|
+| `runtime` | Qdrant mode/URL, MCP transport, tool profile |
+| `models` | Embedding model, sparse model, reranker, Qwen3 sidecar |
+| `ingest` | Chunk size, batch size, write concurrency |
+| `search` | Default mode, rerank limits, diversity |
+| `collections` | Default collection name, naming conventions |
+
 ## Installation
 
 Requirements:

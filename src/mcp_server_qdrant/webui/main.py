@@ -4,6 +4,10 @@ import argparse
 
 import uvicorn
 
+# Load config before creating the app — injects YAML values as env vars.
+from mcp_server_qdrant.config import load_qdrant_config
+load_qdrant_config()
+
 from mcp_server_qdrant.webui.api import create_app
 
 

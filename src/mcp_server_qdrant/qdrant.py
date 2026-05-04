@@ -732,32 +732,39 @@ class QdrantConnector:
                 if not created:
                     return 0
 
-            documents = [e.content for e in entries]
-            vectors = await late_interaction_provider.embed_documents(documents)
             vector_name = late_interaction_provider.get_vector_name()
+            batch_size = _embedding_batch_size()
+            stored = 0
 
-            points = []
-            for i, entry in enumerate(entries):
-                if entry.id:
-                    try:
-                        point_id = str(uuid.UUID(entry.id)).replace("-", "")
-                    except ValueError:
-                        point_id = uuid.uuid5(uuid.NAMESPACE_DNS, entry.id).hex
-                else:
-                    point_id = uuid.uuid4().hex
+            for start in range(0, len(entries), batch_size):
+                batch = entries[start:start + batch_size]
+                documents = [e.content for e in batch]
+                vectors = await late_interaction_provider.embed_documents(documents)
 
-                points.append(
-                    models.PointStruct(
-                        id=point_id,
-                        payload={"document": entry.content, METADATA_PATH: entry.metadata or {}},
-                        vector={vector_name: vectors[i]},
+                points = []
+                for i, entry in enumerate(batch):
+                    if entry.id:
+                        try:
+                            point_id = str(uuid.UUID(entry.id)).replace("-", "")
+                        except ValueError:
+                            point_id = uuid.uuid5(uuid.NAMESPACE_DNS, entry.id).hex
+                    else:
+                        point_id = uuid.uuid4().hex
+
+                    points.append(
+                        models.PointStruct(
+                            id=point_id,
+                            payload={"document": entry.content, METADATA_PATH: entry.metadata or {}},
+                            vector={vector_name: vectors[i]},
+                        )
                     )
-                )
 
-            await self._client.upsert(collection_name=collection_name, points=points, wait=True)
-            return len(entries)
+                await self._client.upsert(collection_name=collection_name, points=points, wait=True)
+                stored += len(batch)
+
+            return stored
         except Exception as e:
-            logger.error(f"Error in batch_store_late_interaction: {e}")
+            logger.error(f"Error in batch_store_late_interaction: {e!r}", exc_info=True)
             return 0
 
     async def batch_store_hybrid(

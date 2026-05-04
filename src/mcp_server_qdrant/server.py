@@ -8,6 +8,11 @@ from mcp_server_qdrant._warnings import filter_upstream_warnings
 
 filter_upstream_warnings()
 
+# Load config file BEFORE importing settings — injects YAML values as env vars
+# for any key not already set in the environment.
+from mcp_server_qdrant.config import load_qdrant_config
+load_qdrant_config()
+
 from mcp_server_qdrant.mcp_server import QdrantMCPServer
 from mcp_server_qdrant.settings import (
     EmbeddingProviderSettings,
