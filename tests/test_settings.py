@@ -79,7 +79,7 @@ class TestEmbeddingProviderSettings:
         """Test default values are set correctly."""
         settings = EmbeddingProviderSettings()
         assert settings.provider_type == EmbeddingProviderType.FASTEMBED
-        assert settings.model_name == "Qwen/Qwen3-Embedding-8B"
+        assert settings.model_name == "Qwen/Qwen3-Embedding-4B"
         assert settings.device == "auto"
         assert settings.qwen3_metrics_path is None
         assert settings.qwen3_response_limit_bytes == 64 * 1024 * 1024

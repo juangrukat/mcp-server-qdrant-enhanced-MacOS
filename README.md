@@ -133,7 +133,9 @@ Requirements:
 
 - Python 3.10 or newer.
 - `uv`.
-- Docker, recommended for shared local Qdrant server mode.
+- Native Qdrant binary (recommended for multi-agent server mode) or Docker.
+  The project ships a macOS arm64 binary at `.local/bin/qdrant` (v1.17.1).
+  A LaunchAgent at `~/Library/LaunchAgents/com.qdrant.server.plist` auto-starts it on login.
 - Rust toolchain, only if building the Qwen3 embedding sidecar locally.
 - macOS for Apple Silicon Metal/MPS acceleration and macOS metadata capture.
 
@@ -164,7 +166,28 @@ uv run --locked pytest
 
 ## Running Locally
 
-### Recommended: Shared Qdrant Server Mode
+### Recommended Setup
+
+For multi-agent use, run Qdrant as a persistent server and connect MCP clients
+to it.
+
+Recommended infrastructure:
+
+- **Qdrant**: native server at `http://127.0.0.1:6333`
+- **MCP**: server mode with `QDRANT_MODE=server`
+- **Embedded mode**: development/testing only
+
+Recommended retrieval policy:
+
+- Use **hybrid collections** for general-purpose RAG.
+- Use `mode="hybrid"` as the normal starting point.
+- Use `mode="rerank"` for higher-quality evidence selection.
+- Use `mode="late_interaction"` for high-recall conceptual search, but only
+  with a late-interaction collection.
+- Do not switch embedding models on an existing collection unless you
+  re-ingest.
+
+### Shared Qdrant Server Mode
 
 Server mode lets the MCP server, REST API, and multiple agents share the same
 Qdrant instance.
@@ -214,17 +237,17 @@ or with local defaults loaded:
 ./scripts/local-run-mcp.sh
 ```
 
-### Embedded Qdrant Mode
+### Embedded Qdrant Mode (Dev / Single-User Only)
 
-Embedded mode stores Qdrant data in a local directory and should be used by only
-one process at a time.
+Embedded mode stores Qdrant data in a local directory and locks the storage to
+a single process. Use this for local testing, not multi-agent setups.
 
 ```bash
 QDRANT_MODE=embedded ./scripts/local-run-mcp.sh
 ```
 
-If a REST process already has the embedded store open, a second MCP process
-using the same path can fail because embedded Qdrant locks the storage.
+Embedded mode cannot be shared between the MCP server and the REST API
+simultaneously — the storage is locked by whoever opens it first.
 
 ## Configuration
 
@@ -238,7 +261,7 @@ Important environment variables:
 | `COLLECTION_NAME` | `documents` | Default collection for tools that allow omission. |
 | `QDRANT_READ_ONLY` | `false` | Disables write/mutation tools when true. |
 | `EMBEDDING_PROVIDER` | `fastembed` | Embedding provider type. |
-| `EMBEDDING_MODEL` | `Qwen/Qwen3-Embedding-8B` | Default dense embedding model. |
+| `EMBEDDING_MODEL` | `Qwen/Qwen3-Embedding-4B` | Default dense embedding model. |
 | `EMBEDDING_DEVICE` | `auto` | Device hint: `auto`, `cpu`, `cuda`, `mps`, or supported local equivalent. |
 | `QWEN3_SIDECAR_PATH` | built sidecar path via scripts | Rust Qwen3 embedder binary path. |
 | `QDRANT_SPARSE_MODEL` | `Qdrant/bm25` | Sparse model for hybrid/rerank retrieval. |

@@ -4,6 +4,7 @@ Enhanced MCP server with improved embedding management and API key security.
 
 # ruff: noqa: E402
 
+import asyncio
 import json
 import logging
 from typing import Annotated, Any
@@ -99,6 +100,15 @@ class QdrantMCPServer(FastMCP):
             if self.qdrant_settings.enable_resources:
                 self.setup_resources()
 
+            # Pre-warm models in the background if there's a running event loop
+            # (present in server/HTTP mode). In stdio MCP mode there's no loop
+            # yet; models will warm on first request via provider caching.
+            try:
+                loop = asyncio.get_running_loop()
+                loop.create_task(self._warm_up_models())
+            except RuntimeError:
+                pass  # no running loop — warm-up deferred to first request
+
         except Exception as e:
             logger.error(f"Failed to initialize MCP server: {e}")
             # For MCP clients, we need to fail gracefully
@@ -148,6 +158,43 @@ class QdrantMCPServer(FastMCP):
             provider = LateInteractionEmbeddingProvider(model_name)
             self._late_interaction_providers[model_name] = provider
         return provider
+
+    async def _warm_up_models(self) -> None:
+        """Pre-download and pre-load all providers so the first request is fast."""
+
+        provider = self.embedding_provider
+        if callable(getattr(provider, "warm_up", None)):
+            try:
+                await provider.warm_up()
+            except Exception:
+                pass
+
+        async def _warm_sparse():
+            try:
+                self.get_sparse_provider()
+            except Exception:
+                pass
+
+        async def _warm_reranker():
+            try:
+                from mcp_server_qdrant.search.reranker import build_default_reranker
+                r = build_default_reranker(
+                    self.qdrant_settings.default_reranker_model,
+                    instruction=self.qdrant_settings.reranker_instruction,
+                )
+                if hasattr(r, "_load"):
+                    await asyncio.get_event_loop().run_in_executor(None, r._load)
+            except Exception:
+                pass
+
+        async def _warm_late_interaction():
+            try:
+                self.get_late_interaction_provider()
+            except Exception:
+                pass
+
+        for _fn in (_warm_sparse, _warm_reranker, _warm_late_interaction):
+            asyncio.ensure_future(_fn())
 
     def _profile_tool(self, *, name: str | None = None, **kwargs):
         """

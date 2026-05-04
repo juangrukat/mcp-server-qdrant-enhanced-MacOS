@@ -121,7 +121,7 @@ class EmbeddingProviderSettings(BaseSettings):
         validation_alias="EMBEDDING_PROVIDER",
     )
     model_name: str = Field(
-        default="Qwen/Qwen3-Embedding-8B",
+        default="Qwen/Qwen3-Embedding-4B",
         validation_alias="EMBEDDING_MODEL",
     )
     device: str = Field(

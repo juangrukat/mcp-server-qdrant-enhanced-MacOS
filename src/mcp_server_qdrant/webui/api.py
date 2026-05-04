@@ -6,6 +6,8 @@ exposing every operation as a JSON HTTP endpoint with auto-generated OpenAPI doc
 
 from __future__ import annotations
 
+import asyncio
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -15,8 +17,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from mcp_server_qdrant.embedding_manager import EnhancedEmbeddingModelManager
+from mcp_server_qdrant.embeddings.sparse import SparseEmbeddingProvider
 from mcp_server_qdrant.mcp_runtime.write_queue import WriteQueue, WriteQueueFullError
 from mcp_server_qdrant.qdrant import BatchEntry, QdrantConnector
+from mcp_server_qdrant.search.reranker import build_default_reranker
 from mcp_server_qdrant.settings import (
     EmbeddingProviderSettings,
     QdrantSettings,
@@ -72,6 +76,7 @@ class SearchDocumentsRequest(BaseModel):
     rerank_top_k: Optional[int] = None
     reranker_model: Optional[str] = None
     reranker_instruction: Optional[str] = None
+    late_interaction_model: Optional[str] = None
 
 
 class IngestFileRequest(BaseModel):
@@ -105,6 +110,8 @@ def create_app(
 
     embedding_manager = EnhancedEmbeddingModelManager(embedding_settings)
     embedding_provider = embedding_manager.get_default_provider()
+    active_provider = {"provider": embedding_provider}
+    _late_interaction_providers: dict[str, object] = {}
 
     connector = QdrantConnector(
         qdrant_url=qdrant_settings.location,
@@ -118,10 +125,58 @@ def create_app(
         max_queue_size=qdrant_settings.write_queue_size,
     )
 
+    @asynccontextmanager
+    async def _lifespan(app: FastAPI):
+        # Warm up the primary embedding provider (pre-starts Qwen3 sidecar).
+        provider = active_provider["provider"]
+        if callable(getattr(provider, "warm_up", None)):
+            try:
+                await provider.warm_up()
+            except Exception:
+                pass  # non-fatal: warmup failure should not prevent startup
+
+        # Pre-download auxiliary model providers in the background so the first
+        # query using sparse, rerank, or late_interaction modes doesn't pay the
+        # HuggingFace download penalty (can be 1-3 minutes for large models).
+        async def _warm_sparse():
+            try:
+                SparseEmbeddingProvider(qdrant_settings.sparse_model)
+            except Exception:
+                pass
+
+        async def _warm_reranker():
+            try:
+                r = build_default_reranker(
+                    qdrant_settings.default_reranker_model,
+                    instruction=qdrant_settings.reranker_instruction,
+                )
+                # Force-load the ONNX model if it's a FastEmbedReranker.
+                if hasattr(r, "_load"):
+                    await asyncio.get_event_loop().run_in_executor(None, r._load)
+            except Exception:
+                pass
+
+        async def _warm_late_interaction():
+            try:
+                from mcp_server_qdrant.embeddings.late_interaction import (
+                    DEFAULT_LATE_INTERACTION_MODEL,
+                    LateInteractionEmbeddingProvider,
+                )
+                LateInteractionEmbeddingProvider(DEFAULT_LATE_INTERACTION_MODEL)
+            except Exception:
+                pass
+
+        # Fire and forget — each downloads/caches independently.
+        for _fn in (_warm_sparse, _warm_reranker, _warm_late_interaction):
+            asyncio.ensure_future(_fn())
+
+        yield
+
     app = FastAPI(
         title="mcp-server-qdrant-enhanced-MacOS",
         description="REST API for Qdrant + macOS file ingestion. Mirrors the MCP tool surface.",
         version="0.8.0",
+        lifespan=_lifespan,
     )
 
     if cors_origins:
@@ -137,12 +192,32 @@ def create_app(
     @app.get("/health")
     async def health() -> dict:
         queue_stats = await write_queue.stats()
+        provider = active_provider["provider"]
         return {
             "status": "ok",
-            "embedding_model": embedding_provider.get_model_name(),
-            "vector_size": embedding_provider.get_vector_size(),
+            "embedding_model": provider.get_model_name(),
+            "vector_size": provider.get_vector_size(),
             "write_queue": queue_stats.__dict__,
         }
+
+    async def ensure_collection_matches_active_provider(collection_name: str) -> None:
+        """Reject searches before loading a mismatched embedding model."""
+        info = await connector.get_detailed_collection_info(collection_name)
+        if not info:
+            raise HTTPException(status_code=404, detail=f"Collection '{collection_name}' not found")
+
+        provider = active_provider["provider"]
+        provider_size = provider.get_vector_size()
+        if info.vector_size and info.vector_size != provider_size:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Active embedding model '{provider.get_model_name()}' produces "
+                    f"{provider_size}D vectors, but collection '{collection_name}' "
+                    f"expects {info.vector_size}D vectors. Start the server with the "
+                    "matching EMBEDDING_MODEL or call /embedding_models/active first."
+                ),
+            )
 
     # --- Collections ---
 
@@ -281,6 +356,7 @@ def create_app(
     async def search(req: SearchRequest) -> dict:
         from mcp_server_qdrant.search.filter_grammar import compile_filter
 
+        await ensure_collection_matches_active_provider(req.collection_name)
         qfilter = compile_filter(req.filter) if req.filter else None
         results = await connector.hybrid_search(
             query=req.query,
@@ -305,12 +381,12 @@ def create_app(
         from mcp_server_qdrant.search.document_search import search_documents_grouped
         from mcp_server_qdrant.search.filter_grammar import compile_filter
         from mcp_server_qdrant.search.retrieval_mode import RetrievalMode
-        from mcp_server_qdrant.embeddings.sparse import SparseEmbeddingProvider
-        from mcp_server_qdrant.search.reranker import build_default_reranker
         from mcp_server_qdrant.qdrant import _retrieval_warnings
 
         qfilter = compile_filter(req.filter) if req.filter else None
         rmode = RetrievalMode.parse(req.mode)
+        if rmode != RetrievalMode.LATE_INTERACTION:
+            await ensure_collection_matches_active_provider(req.collection_name)
         use_sparse = rmode in (RetrievalMode.HYBRID, RetrievalMode.RERANK)
         sparse_provider = SparseEmbeddingProvider(qdrant_settings.sparse_model) if use_sparse else None
 
@@ -321,6 +397,17 @@ def create_app(
                 reranker_name,
                 instruction=req.reranker_instruction or qdrant_settings.reranker_instruction,
             )
+
+        late_interaction_provider = None
+        if rmode == RetrievalMode.LATE_INTERACTION:
+            from mcp_server_qdrant.embeddings.late_interaction import (
+                DEFAULT_LATE_INTERACTION_MODEL,
+                LateInteractionEmbeddingProvider,
+            )
+            li_model = req.late_interaction_model or DEFAULT_LATE_INTERACTION_MODEL
+            if li_model not in _late_interaction_providers:
+                _late_interaction_providers[li_model] = LateInteractionEmbeddingProvider(li_model)
+            late_interaction_provider = _late_interaction_providers[li_model]
 
         warnings_sink: list[str] = []
         _retrieval_warnings.set(warnings_sink)
@@ -333,8 +420,9 @@ def create_app(
             chunks_per_document=req.chunks_per_document,
             query_filter=qfilter,
             sparse_provider=sparse_provider,
+            late_interaction_provider=late_interaction_provider,
             reranker=reranker,
-            embedding_provider=embedding_provider,
+            embedding_provider=active_provider["provider"],
             prefetch_limit=req.prefetch_limit,
             rerank_top_k=req.rerank_top_k,
             additional_queries=req.additional_queries or None,
@@ -514,6 +602,7 @@ def create_app(
         if not info:
             raise HTTPException(status_code=400, detail=f"Unknown model: {req.model_name}")
         provider = embedding_manager.create_provider_for_model(req.model_name)
+        active_provider["provider"] = provider
         connector.set_embedding_provider(provider)
         return {
             "active_model": req.model_name,

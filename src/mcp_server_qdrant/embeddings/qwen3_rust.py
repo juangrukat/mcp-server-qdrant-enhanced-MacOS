@@ -41,6 +41,10 @@ class Qwen3RustProvider(EmbeddingProvider):
         self._lock = asyncio.Lock()
         self._ready: dict[str, Any] | None = None
 
+    async def warm_up(self) -> None:
+        """Pre-start the sidecar subprocess so the first real request has no cold start."""
+        await self._ensure_process()
+
     async def embed_documents(self, documents: list[str]) -> list[list[float]]:
         passages = [self._document_input(document) for document in documents]
         response = await self._request(
