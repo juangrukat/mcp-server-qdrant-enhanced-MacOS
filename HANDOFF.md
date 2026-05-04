@@ -10,13 +10,19 @@ This repo runs locally with either single-process Qdrant embedded storage or
 multi-agent Qdrant server mode, plus a Rust fastembed/Candle sidecar for Qwen3
 embeddings on Apple Silicon Metal.
 
+Two-stage hybrid retrieval is now fully operational:
+- Dense: Qwen3-Embedding-4B (Rust sidecar, Metal)
+- Sparse: BM25 or BM42 (fastembed)
+- Reranker: Qwen3-Reranker-4B (transformers, MPS) or MiniLM (fastembed ONNX)
+- Multi-query: `additional_queries` parameter merges candidate pools before reranking
+
 The active local REST API was last verified at:
 
 - URL: `http://127.0.0.1:8765`
 - Docs: `http://127.0.0.1:8765/docs`
 - Active model: `Qwen/Qwen3-Embedding-4B`
 - Vector size: `2560`
-- Test result: `52 passed, 1 skipped`
+- Test result: `60 passed, 1 skipped`
 
 The optional skipped test is:
 
@@ -301,12 +307,20 @@ curl -X POST http://127.0.0.1:8765/embedding_models/active \
   --data '{"model_name":"Qwen/Qwen3-Embedding-4B"}'
 ```
 
-Ingest one file:
+Create a hybrid (dense + BM25) collection:
+
+```bash
+curl -X POST http://127.0.0.1:8765/collections/hybrid \
+  -H 'Content-Type: application/json' \
+  --data '{"collection_name":"my_docs_hybrid","embedding_model":"Qwen/Qwen3-Embedding-4B","distance":"cosine"}'
+```
+
+Ingest one file (auto-detects hybrid vs dense from collection config):
 
 ```bash
 curl -X POST http://127.0.0.1:8765/ingest/file \
   -H 'Content-Type: application/json' \
-  --data '{"file_path":"/absolute/path/to/file.pdf","collection_name":"my_docs_qwen3_4b"}'
+  --data '{"file_path":"/absolute/path/to/file.pdf","collection_name":"my_docs_hybrid"}'
 ```
 
 Search:
@@ -317,8 +331,9 @@ curl -X POST http://127.0.0.1:8765/search_documents \
   --data '{"query":"your question","collection_name":"my_docs_qwen3_4b","limit":5,"chunks_per_document":4}'
 ```
 
-## Key Fixes In This Session
+## Key Fixes In This Session (2026-05-03, session 2)
 
+### Session 1 (original)
 - Added `Qwen/Qwen3-Embedding-4B` as a first-class supported Qwen3 model.
 - Added Qwen3 response-buffer setting for large sidecar JSON responses.
 - Added per-call Qwen3 metrics logging.
@@ -326,15 +341,95 @@ curl -X POST http://127.0.0.1:8765/search_documents \
 - Reduced default ingest chunk size to 700 chars with 70 overlap.
 - Reduced default embedding batch size to 4.
 - Made `batch_store` upsert incrementally per embedding batch.
-- Fixed Qdrant local query shape:
-  - old: `query=(vector_name, vector)`
-  - new: `query=vector, using=vector_name`
+- Fixed Qdrant local query shape.
+
+### Session 2
+- **Implemented `QwenReranker`**: Qwen3-Reranker-{0.6B,4B,8B} via `transformers`
+  `AutoModelForCausalLM`. CausalLM yes/no logit scoring. Auto-selects MPS on
+  Apple Silicon. Lazy-loads on first use. Configurable batch size and instruction.
+- **BM42 support**: `QDRANT_SPARSE_MODEL=Qdrant/bm42-all-minilm-l6-v2-attentions`
+  as an alternative to BM25.
+- **Multi-query retrieval** (`additional_queries` param): run parallel subqueries,
+  merge+dedup by content hash, rerank all unique candidates against the primary
+  query. This is the most important fix for recall regression when query compression
+  drops rare/discriminative terms.
+- **Diversity pass**: after reranking, limit ≤2 chunks per page/section to prevent
+  same-region clustering in the answer context.
+- **Configurable candidate pool**: `prefetch_limit`, `rerank_top_k`,
+  `QDRANT_RERANKER_INSTRUCTION` env var, per-request instruction override.
+- **Optional `[reranking]` extras**: `torch>=2.0`, `transformers>=4.51`,
+  `accelerate>=0.26` via `uv pip install 'mcp-server-qdrant[reranking]'`.
+- Rewrote README with Mermaid architecture diagram, calibration guide, A/B
+  progression, and multi-query guidance.
+
+### Session 3 (2026-05-04)
+- **Hybrid fallback observability**: `_retrieval_warnings` ContextVar; sparse fallback
+  warnings surface in MCP response envelope `observability.warnings`. REST API also
+  collects warnings and returns them as `response.warnings`.
+- **Hybrid fallback tests** (`tests/test_hybrid_fallback.py`): 6 tests covering RRF
+  exception, empty-RRF, ContextVar propagation, both-fail graceful return.
+- **REST API reranker support**: `SearchDocumentsRequest` now accepts `reranker_model`
+  and `reranker_instruction`. The `/search_documents` endpoint builds and applies the
+  reranker the same way the MCP tool does.
+- **`batch_store_hybrid` batching fix**: was sending all entries to embedder at once
+  (OOM on 878-chunk books). Now iterates in `QDRANT_EMBEDDING_BATCH_SIZE` batches,
+  matches `batch_store` behavior.
+- **PDF whitespace normalization** (`build_chunks`): `re.sub(r"[^\S\n]+", " ", text)`
+  collapses PDF column-layout double-spaces before chunking. Fixes phrase-match failures
+  like `"Critical  reading,  critical  thinking"` → `"Critical reading, critical thinking"`.
+- **Retrieval diagnostic script** (`scripts/diagnostic_retrieval.py`): runs 5 configs
+  (dense, hybrid, hybrid+MiniLM, multi-query, multi-query+MiniLM) against gold phrases,
+  writes `test-1/summary.md`, per-config chunk tables, and JSON results.
+- **`socratic_circles_hybrid` collection**: dense (Qwen3-4B, 2560d) + sparse (BM25)
+  hybrid collection; re-ingested Socratic Circles with whitespace normalization applied.
+- **`POST /collections/hybrid` REST endpoint**: new endpoint that creates a collection
+  with both dense and sparse (BM25) vector slots in one call. Accepts same fields as
+  `POST /collections` plus optional `sparse_model` (default `Qdrant/bm25`).
+- **Auto-routing ingest** (`/ingest/file`, `/ingest/folder`): both endpoints now call
+  `get_sparse_vector_name()` on the target collection. If sparse vectors are present
+  (hybrid collection), ingest automatically uses `batch_store_hybrid`; otherwise uses
+  `batch_store`. No request-level parameter needed.
+- **`get_sparse_vector_name()` helper** (`qdrant.py`): returns first sparse vector name
+  or None. Used by ingest routing and tested in 3 new unit tests
+  (`test_hybrid_fallback.py`).
+- **REST API route tests** (`tests/test_webui_api_routes.py`): 3 new tests verifying
+  `POST /collections/hybrid` route exists, calls `create_hybrid_collection`, and is
+  not swallowed by `DELETE /collections/{name}`.
+- **Gold phrase correction** (`diagnostic_retrieval.py`): G4/G8 were from Adler (1982)
+  directly, not from Copeland's 2005 book. Corrected: G4→"raise their minds up from a
+  state of understanding", G8→"Wednesday Revolution". Confirmed via page-by-page
+  pdfminer scan.
+- **`socratic_circles_hybrid_v2` collection**: fresh hybrid collection re-ingested with
+  whitespace normalization applied from the start. Corrects the double-space embedding
+  artifacts in the original `socratic_circles_hybrid`.
+- **Diagnostic findings** (`test-1/diagnosis.md`):
+  - Multi-query is the largest single improvement (G5/G6 rank 2 vs never found)
+  - MiniLM reranker hurts this academic domain (G5/G6 drop rank 2→48); use Qwen3-Reranker
+  - `socratic_circles_qwen3_4b` was dense-only; hybrid tests blocked until now
+  - G4/G8 invalid gold phrases — "not the possession of knowledge" and "desire and
+    capacity to learn" are from Adler (1982) directly, NOT quoted in Copeland's book.
+    Replaced with valid phrases: G4→"raise their minds up from a state of understanding"
+    (pgs 18/122), G8→"Wednesday Revolution" (pg 124). This is a gold-set correction,
+    not a PDF extraction failure.
+
+## Collections Verified
+
+Current known local collections:
+
+- `documents`
+- `socratic_circles_qwen3_4b` — dense-only (Qwen3-4B), 878 chunks, original ingest
+- `socratic_circles_hybrid` — dense (Qwen3-4B) + BM25 sparse, 878 chunks,
+  double-space artifacts in stored text (normalization applied mid-ingest)
+- `socratic_circles_hybrid_v2` — dense (Qwen3-4B) + BM25 sparse, fully
+  whitespace-normalized; re-ingested with corrected `build_chunks`; use this for
+  v2 diagnostic runs and future production use
 
 ## Known Caveats
 
-- PDF extraction can still produce ugly chunks, especially letter-spaced pages
-  or copyright/rubric pages. Retrieval works, but a future text-cleaning pass
-  would improve quality.
+- G4/G8 gold phrases in the original diagnostic were wrong — those phrases are from
+  Adler's 1982 source book, not from Copeland's 2005 book which is the PDF. Confirmed
+  via page-by-page pdfminer scan (zero matches). Gold phrases corrected in
+  `scripts/diagnostic_retrieval.py`. Future v2 diagnostic runs use valid gold phrases.
 - Qwen3 8B is too slow for book-scale local ingestion on this machine unless
   quality needs justify hours of runtime.
 - Embedded Qdrant storage is single-process. Multi-agent launch should use
@@ -355,5 +450,10 @@ curl http://127.0.0.1:8765/collections/socratic_circles_qwen3_4b
 Expected latest full test result:
 
 ```text
-44 passed, 1 skipped
+74 passed, 1 skipped
 ```
+
+(71 + 3 new in `tests/test_webui_api_routes.py`:
+`test_post_collections_hybrid_route_exists`,
+`test_post_collections_hybrid_calls_create_hybrid_collection`,
+`test_collections_hybrid_route_not_swallowed_by_parameterized_route`)
